@@ -725,6 +725,7 @@ class StatePersistence:
             "total_invested": state.total_invested,
             "total_returned": state.total_returned,
             "session_start": state.session_start,
+            "analyzed_today": list(state.analyzed_today),
             "open_positions": [vars(p) for p in state.open_positions],
             "closed_positions": [vars(p) for p in state.closed_positions[-100:]],  # últimas 100
         }
@@ -747,6 +748,7 @@ class StatePersistence:
             state.total_invested = data.get("total_invested", 0)
             state.total_returned = data.get("total_returned", 0)
             state.session_start = data.get("session_start", datetime.now().isoformat())
+            state.analyzed_today = set(data.get("analyzed_today", []))
             state.open_positions = [Position(**p) for p in data.get("open_positions", [])]
             state.closed_positions = [Position(**p) for p in data.get("closed_positions", [])]
             log.info(f"Estado cargado: bankroll=${state.bankroll:.2f} | {len(state.open_positions)} posiciones abiertas")
