@@ -69,17 +69,17 @@ CONFIG = {
     # Cerrar si quedan menos de N días para resolución (capturar liquidez)
     "CLOSE_DAYS_LEFT":      int(os.getenv("CLOSE_DAYS_LEFT", "3")),
     # Cerrar si el edge ya desapareció (mercado corrigió)
-    "CLOSE_IF_EDGE_GONE":   os.getenv("CLOSE_IF_EDGE_GONE", "true").lower() == "true",
- 
+    "CLOSE_IF_EDGE_GONE":   os.getenv("CLOSE_IF_EDGE_GONE", "false").lower() == "true",
+
     # ── Riesgo global ───────────────────────────────────────
     "MAX_OPEN_BETS":        int(os.getenv("MAX_OPEN_BETS", "8")),
     "MAX_DAILY_LOSS":       float(os.getenv("MAX_DAILY_LOSS", "20")),
-    "MIN_LIQUIDITY":        float(os.getenv("MIN_LIQUIDITY", "500")),
-    "MIN_VOLUME":           float(os.getenv("MIN_VOLUME", "1000")),
- 
+    "MIN_LIQUIDITY":        float(os.getenv("MIN_LIQUIDITY", "5000")),
+    "MIN_VOLUME":           float(os.getenv("MIN_VOLUME", "5000")),
+
     # ── Operación ───────────────────────────────────────────
-    "SCAN_INTERVAL_MIN":    int(os.getenv("SCAN_INTERVAL_MIN", "30")),
-    "MAX_MARKETS_PER_RUN":  int(os.getenv("MAX_MARKETS_PER_RUN", "20")),
+    "SCAN_INTERVAL_MIN":    int(os.getenv("SCAN_INTERVAL_MIN", "60")),
+    "MAX_MARKETS_PER_RUN":  int(os.getenv("MAX_MARKETS_PER_RUN", "5")),
     "DRY_RUN":              os.getenv("DRY_RUN", "true").lower() == "true",
     "STATE_FILE":           "agent_state.json",
     "LOG_FILE":             "polymarket_agent.log",
