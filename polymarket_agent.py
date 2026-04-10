@@ -393,7 +393,7 @@ Si el edge es menor a 5% o no tienes info suficiente: has_edge: false, edge: 0."
  
         try:
             response = self.client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-haiku-4-5-20251001",
                 max_tokens=800,
                 tools=[{"type": "web_search_20250305", "name": "web_search"}],
                 messages=[{"role": "user", "content": prompt}]
@@ -468,7 +468,7 @@ RESPONDE SOLO EN JSON:
  
         try:
             response = self.client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model="claude-haiku-4-5-20251001",
                 max_tokens=300,
                 tools=[{"type": "web_search_20250305", "name": "web_search"}],
                 messages=[{"role": "user", "content": prompt}]
@@ -725,6 +725,7 @@ class StatePersistence:
             "total_invested": state.total_invested,
             "total_returned": state.total_returned,
             "session_start": state.session_start,
+            "analyzed_today": list(state.analyzed_today),
             "open_positions": [vars(p) for p in state.open_positions],
             "closed_positions": [vars(p) for p in state.closed_positions[-100:]],  # últimas 100
         }
@@ -747,6 +748,7 @@ class StatePersistence:
             state.total_invested = data.get("total_invested", 0)
             state.total_returned = data.get("total_returned", 0)
             state.session_start = data.get("session_start", datetime.now().isoformat())
+            state.analyzed_today = set(data.get("analyzed_today", []))
             state.open_positions = [Position(**p) for p in data.get("open_positions", [])]
             state.closed_positions = [Position(**p) for p in data.get("closed_positions", [])]
             log.info(f"Estado cargado: bankroll=${state.bankroll:.2f} | {len(state.open_positions)} posiciones abiertas")
