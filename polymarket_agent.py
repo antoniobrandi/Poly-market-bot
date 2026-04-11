@@ -940,10 +940,35 @@ class PolymarketAgent:
  
  
 # ═══════════════════════════════════════════════════════════
+#  KEEP-ALIVE SERVER (para UptimeRobot / Replit free tier)
+# ═══════════════════════════════════════════════════════════
+def run_keep_alive():
+    """Servidor Flask minimalista para que UptimeRobot haga ping y Replit no duerma."""
+    from flask import Flask
+    import threading
+
+    app = Flask(__name__)
+
+    @app.route("/")
+    @app.route("/ping")
+    def ping():
+        return "OK", 200
+
+    port = int(os.getenv("PORT", 8080))
+    thread = threading.Thread(
+        target=lambda: app.run(host="0.0.0.0", port=port, use_reloader=False),
+        daemon=True,
+    )
+    thread.start()
+    log.info(f"Keep-alive server corriendo en puerto {port}")
+
+
+# ═══════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
     if not CONFIG["ANTHROPIC_API_KEY"]:
         print("ERROR: Falta ANTHROPIC_API_KEY en el .env")
         sys.exit(1)
+    run_keep_alive()
     PolymarketAgent().run()
