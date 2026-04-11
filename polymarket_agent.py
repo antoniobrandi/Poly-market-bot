@@ -48,6 +48,7 @@ load_dotenv()
 CONFIG = {
     "ANTHROPIC_API_KEY":    os.getenv("ANTHROPIC_API_KEY", ""),
     "PRIVATE_KEY":          os.getenv("POLYMARKET_PRIVATE_KEY", ""),
+    "PROXY_ADDRESS":        os.getenv("POLYMARKET_PROXY_ADDRESS", ""),
     "API_KEY":              os.getenv("POLYMARKET_API_KEY", ""),
     "API_SECRET":           os.getenv("POLYMARKET_API_SECRET", ""),
     "API_PASSPHRASE":       os.getenv("POLYMARKET_API_PASSPHRASE", ""),
@@ -592,7 +593,7 @@ class OrderExecutor:
         self.clob = None
         if not CONFIG["DRY_RUN"] and CLOB_AVAILABLE and CONFIG["PRIVATE_KEY"]:
             try:
-                self.clob = ClobClient(
+                kwargs = dict(
                     host=CLOB_API, chain_id=POLYGON,
                     key=CONFIG["PRIVATE_KEY"],
                     creds={
@@ -601,6 +602,10 @@ class OrderExecutor:
                         "api_passphrase": CONFIG["API_PASSPHRASE"],
                     }
                 )
+                if CONFIG["PROXY_ADDRESS"]:
+                    kwargs["funder"] = CONFIG["PROXY_ADDRESS"]
+                    log.info(f"🔑 Proxy Wallet detectada: {CONFIG['PROXY_ADDRESS'][:10]}...")
+                self.clob = ClobClient(**kwargs)
                 log.info("✅ CLOB conectado — modo REAL")
             except Exception as e:
                 log.error(f"Error CLOB: {e}")
