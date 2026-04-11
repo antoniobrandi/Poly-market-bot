@@ -951,8 +951,9 @@ def run_keep_alive():
 
     @app.route("/")
     @app.route("/ping")
+    @app.route("/api/alive")
     def ping():
-        return "OK", 200
+        return {"status": "alive"}, 200
 
     port = int(os.getenv("PORT", 8080))
     thread = threading.Thread(
