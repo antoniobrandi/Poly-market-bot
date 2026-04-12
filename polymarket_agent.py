@@ -33,7 +33,7 @@ import requests
  
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, Side
+    from py_clob_client.clob_types import OrderArgs
     from py_clob_client.constants import POLYGON
     CLOB_AVAILABLE = True
 except ImportError:
@@ -629,7 +629,7 @@ class OrderExecutor:
                     token_id=opp.token_id,
                     price=round(opp.market_price + 0.001, 3),
                     size=opp.bet_size_usd,
-                    side=Side.BUY,
+                    side="BUY",
                 )
                 self.clob.create_and_post_order(order)
             except Exception as e:
@@ -672,7 +672,7 @@ class OrderExecutor:
                 token_id=position.token_id,
                 price=round(current_price - 0.001, 3),
                 size=position.shares,
-                side=Side.SELL,
+                side="SELL",
             )
             self.clob.create_and_post_order(order)
             return received
