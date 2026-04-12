@@ -80,6 +80,8 @@ CONFIG = {
     # ── Operación ───────────────────────────────────────────
     "SCAN_INTERVAL_MIN":    int(os.getenv("SCAN_INTERVAL_MIN", "60")),
     "MAX_MARKETS_PER_RUN":  int(os.getenv("MAX_MARKETS_PER_RUN", "5")),
+    "PRE_FILTER_BATCH_SIZE": int(os.getenv("PRE_FILTER_BATCH_SIZE", "40")),  # max mercados al pre-filtro
+    "PRE_FILTER_TOP_N":      int(os.getenv("PRE_FILTER_TOP_N", "5")),        # cuántos pasan a análisis profundo
     "DRY_RUN":              os.getenv("DRY_RUN", "true").lower() == "true",
     "STATE_FILE":           "agent_state.json",
     "LOG_FILE":             "polymarket_agent.log",
@@ -314,8 +316,21 @@ class PolymarketScanner:
                 if days_left < 2 or days_left > 90: continue
             except Exception:
                 continue
+
+            # Fase 1a: Rango de precios — descartar si todos los outcomes son extremos
+            # Mercados a 0.95/0.05 ya están decididos, hay poco edge
+            prices = [o["price"] for o in m.outcomes]
+            if not any(0.15 <= p <= 0.85 for p in prices):
+                continue
+
+            # Fase 1b: Integridad binaria — en mercados Yes/No los precios deben sumar ~1.0
+            if len(m.outcomes) == 2:
+                price_sum = sum(o["price"] for o in m.outcomes)
+                if abs(price_sum - 1.0) > 0.05:
+                    continue
+
             filtered.append(m)
-        log.info(f"Mercados tras filtro: {len(filtered)}")
+        log.info(f"Mercados tras filtro fase 1: {len(filtered)}")
         return filtered
  
     def get_token_price(self, token_id: str) -> Optional[float]:
@@ -513,6 +528,96 @@ RESPONDE SOLO EN JSON:
         return round(min(max(raw, CONFIG["MIN_BET_USD"]),
                          CONFIG["MAX_BET_USD"],
                          max_by_pct), 2)
+
+    def pre_filter_markets(self, markets: list[Market]) -> list[Market]:
+        """
+        Fase 2: Pre-filtro barato usando Claude SIN web search.
+        Manda todos los mercados que pasaron la Fase 1 en UN solo llamado.
+        Claude elige los mas prometedores solo leyendo la pregunta y precios.
+        Costo: ~$0.01 por ciclo en lugar de $0.08 x N.
+        """
+        if not markets:
+            return []
+
+        top_n = CONFIG["PRE_FILTER_TOP_N"]
+
+        # Si hay pocos mercados, no vale la pena el llamado extra
+        if len(markets) <= top_n:
+            log.info(f"Pre-filtro fase 2: solo {len(markets)} mercados, saltando llamado batch")
+            return markets
+
+        # Construir prompt con todos los mercados en una sola lista
+        market_lines = []
+        for i, m in enumerate(markets):
+            prices_str = ", ".join(
+                f"{o['name']}={o['price']:.2f}" for o in m.outcomes
+            )
+            market_lines.append(
+                f"{i+1}. [{m.condition_id}] {m.question} | "
+                f"Precios: {prices_str} | Vol: ${m.volume:,.0f} | Liq: ${m.liquidity:,.0f}"
+            )
+
+        markets_text = "\n".join(market_lines)
+        example_id1 = markets[0].condition_id
+        example_id2 = markets[1].condition_id if len(markets) > 1 else "xxx"
+
+        prompt = (
+            f"Eres un analista de mercados de prediccion. Tienes {len(markets)} mercados activos de Polymarket.\n\n"
+            f"Tu tarea: identificar los {top_n} mercados con MAS PROBABILIDAD de tener un precio EQUIVOCADO ahora mismo.\n\n"
+            f"Busca:\n"
+            f"- Mercados sobre eventos proximos donde las noticias recientes pueden haber cambiado la probabilidad real\n"
+            f"- Mercados con precios entre 0.25-0.75 (mas margen para mispricing)\n"
+            f"- Mercados sobre temas donde el sentimiento publico se retrasa respecto a la realidad\n"
+            f"- Mercados con preguntas especificas y verificables\n"
+            f"- Evita mercados sobre temas sin desarrollos recientes\n\n"
+            f"MERCADOS:\n{markets_text}\n\n"
+            f"Devuelve SOLO un array JSON con los condition_ids de los {top_n} mejores mercados, en orden de prioridad.\n"
+            f'Ejemplo: ["{example_id1}", "{example_id2}"]\n\n'
+            f"SOLO el array JSON, sin texto adicional."
+        )
+
+        try:
+            response = self.client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=500,
+                messages=[{"role": "user", "content": prompt}]
+                # SIN tools= -> sin web search -> muy barato (~$0.01)
+            )
+            text = "".join(b.text for b in response.content if b.type == "text").strip()
+
+            # Parsear el array JSON de condition_ids
+            start = text.find("[")
+            end = text.rfind("]") + 1
+            if start == -1 or end == 0:
+                log.warning("Pre-filtro fase 2: no se pudo parsear respuesta, usando top por volumen")
+                return markets[:top_n]
+
+            selected_ids = json.loads(text[start:end])
+            if not isinstance(selected_ids, list):
+                log.warning("Pre-filtro fase 2: respuesta no es lista, usando top por volumen")
+                return markets[:top_n]
+
+            # Reconstruir lista en el orden que eligio Claude
+            market_map = {m.condition_id: m for m in markets}
+            result = []
+            for cid in selected_ids:
+                cid_str = str(cid).strip()
+                if cid_str in market_map and market_map[cid_str] not in result:
+                    result.append(market_map[cid_str])
+
+            if not result:
+                log.warning("Pre-filtro fase 2: ningun ID coincidio, usando top por volumen")
+                return markets[:top_n]
+
+            log.info(
+                f"Pre-filtro fase 2: {len(markets)} -> {len(result)} mercados seleccionados por Claude (sin web search)"
+            )
+            return result
+
+        except Exception as e:
+            log.error(f"Error en pre_filter_markets: {e}")
+            return markets[:top_n]
+
  
  
 # ═══════════════════════════════════════════════════════════
@@ -818,9 +923,11 @@ class PolymarketAgent:
             return
  
         markets = self.scanner.get_active_markets()
-        markets = self.scanner.filter_markets(markets)
+        markets = self.scanner.filter_markets(markets)            # Fase 1: filtros de código (gratis)
         markets.sort(key=lambda m: m.volume, reverse=True)
-        markets = markets[:CONFIG["MAX_MARKETS_PER_RUN"]]
+        markets = markets[:CONFIG["PRE_FILTER_BATCH_SIZE"]]       # cap: hasta 40 al pre-filtro
+        markets = self.analyzer.pre_filter_markets(markets)       # Fase 2: Claude sin web search (~$0.01)
+        markets = markets[:CONFIG["MAX_MARKETS_PER_RUN"]]         # Fase 3: análisis profundo con web search
  
         opps = []
         for i, m in enumerate(markets):
