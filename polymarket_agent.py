@@ -292,14 +292,30 @@ class PolymarketScanner:
  
     def _parse_outcomes(self, m: dict) -> list[dict]:
         outcomes = []
-        for t in m.get("tokens", []):
-            price = float(t.get("price", 0))
-            if 0.01 <= price <= 0.99:
-                outcomes.append({
-                    "name": t.get("outcome", ""),
-                    "token_id": t.get("tokenId", ""),
-                    "price": price,
-                })
+        names = m.get("outcomes", [])
+        prices = m.get("outcomePrices", [])
+        token_ids = m.get("clobTokenIds", [])
+        if isinstance(names, str):
+            try: names = json.loads(names)
+            except: names = []
+        if isinstance(prices, str):
+            try: prices = json.loads(prices)
+            except: prices = []
+        if isinstance(token_ids, str):
+            try: token_ids = json.loads(token_ids)
+            except: token_ids = []
+        for i, name in enumerate(names):
+            try:
+                price = float(prices[i]) if i < len(prices) else 0
+                tid = token_ids[i] if i < len(token_ids) else ""
+                if 0.01 <= price <= 0.99 and tid:
+                    outcomes.append({
+                        "name": name,
+                        "token_id": tid,
+                        "price": price,
+                    })
+            except (ValueError, IndexError):
+                continue
         return outcomes
  
     def filter_markets(self, markets: list[Market]) -> list[Market]:
