@@ -293,14 +293,44 @@ class PolymarketScanner:
  
     def _parse_outcomes(self, m: dict) -> list[dict]:
         outcomes = []
+
+        # Formato nuevo: outcomes/outcomePrices/clobTokenIds son strings JSON
+        raw_names   = m.get("outcomes", "[]")
+        raw_prices  = m.get("outcomePrices", "[]")
+        raw_token_ids = m.get("clobTokenIds", "[]")
+        if isinstance(raw_names, str):
+            try:
+                names     = json.loads(raw_names)
+                prices    = json.loads(raw_prices)
+                token_ids = json.loads(raw_token_ids)
+                for i, name in enumerate(names):
+                    try:
+                        price = float(prices[i]) if i < len(prices) else 0
+                        if 0.01 <= price <= 0.99:
+                            outcomes.append({
+                                "name": name,
+                                "token_id": token_ids[i] if i < len(token_ids) else "",
+                                "price": price,
+                            })
+                    except Exception:
+                        continue
+                if outcomes:
+                    return outcomes
+            except Exception:
+                pass
+
+        # Formato anterior: tokens es una lista de objetos
         for t in m.get("tokens", []):
-            price = float(t.get("price", 0))
-            if 0.01 <= price <= 0.99:
-                outcomes.append({
-                    "name": t.get("outcome", ""),
-                    "token_id": t.get("tokenId", ""),
-                    "price": price,
-                })
+            try:
+                price = float(t.get("price", 0))
+                if 0.01 <= price <= 0.99:
+                    outcomes.append({
+                        "name": t.get("outcome", ""),
+                        "token_id": t.get("tokenId", ""),
+                        "price": price,
+                    })
+            except Exception:
+                continue
         return outcomes
  
     def filter_markets(self, markets: list[Market]) -> list[Market]:
