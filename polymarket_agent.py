@@ -1277,7 +1277,18 @@ class PolymarketAgent:
         markets.sort(key=edge_score, reverse=True)
         log.info(f"Top categorías: {[m.category for m in markets[:5]]}")  # para calibrar bonuses
         markets = markets[:20]                                    # cap: 20 al pre-filtro
-        markets = self.analyzer.pre_filter_markets(markets)       # Fase 2: Claude sin web search (~$0.01)
+
+        # Excluir mercados ya analizados HOY antes de pasar a Claude
+        # Así el pre-filtro no selecciona mercados que ya descartamos (~$0.01 ahorrado por ciclo)
+        fresh_markets = [m for m in markets if m.condition_id not in self.state.analyzed_today]
+        if not fresh_markets:
+            log.info("Todos los mercados prometedores ya fueron analizados hoy — saltando Phase 2/3")
+            markets = []
+        else:
+            if len(fresh_markets) < len(markets):
+                log.info(f"Pre-filtro: excluyendo {len(markets)-len(fresh_markets)} ya analizados hoy")
+            markets = self.analyzer.pre_filter_markets(fresh_markets)  # Fase 2: Claude sin web search (~$0.01)
+
         markets = markets[:CONFIG["MAX_MARKETS_PER_RUN"]]         # Fase 3: análisis profundo con web search
  
         opps = []
