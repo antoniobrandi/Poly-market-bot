@@ -34,7 +34,7 @@ import requests
  
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs
+    from py_clob_client.clob_types import OrderArgs, ApiCreds
     from py_clob_client.constants import POLYGON
     CLOB_AVAILABLE = True
 except ImportError:
@@ -893,15 +893,26 @@ class OrderExecutor:
         self.clob = None
         if not CONFIG["DRY_RUN"] and CLOB_AVAILABLE and CONFIG["PRIVATE_KEY"]:
             try:
-                self.clob = ClobClient(
-                    host=CLOB_API, chain_id=POLYGON,
-                    key=CONFIG["PRIVATE_KEY"],
-                    creds={
-                        "api_key": CONFIG["API_KEY"],
-                        "api_secret": CONFIG["API_SECRET"],
-                        "api_passphrase": CONFIG["API_PASSPHRASE"],
-                    }
-                )
+                # ApiCreds requerido en py-clob-client >= 0.30 (ya no acepta dict)
+                creds = ApiCreds(
+                    api_key=CONFIG["API_KEY"],
+                    api_secret=CONFIG["API_SECRET"],
+                    api_passphrase=CONFIG["API_PASSPHRASE"],
+                ) if CONFIG["API_KEY"] else None
+
+                kwargs = dict(host=CLOB_API, chain_id=POLYGON, key=CONFIG["PRIVATE_KEY"])
+                if creds:
+                    kwargs["creds"] = creds
+                if CONFIG["PROXY_ADDRESS"]:
+                    kwargs["funder"] = CONFIG["PROXY_ADDRESS"]
+
+                self.clob = ClobClient(**kwargs)
+
+                # Si no tenemos creds, derivarlas del private key
+                if not creds:
+                    derived = self.clob.derive_api_key()
+                    self.clob.set_api_creds(self.clob.create_or_derive_api_creds())
+
                 log.info("✅ CLOB conectado — modo REAL")
             except Exception as e:
                 log.error(f"Error CLOB: {e}")
