@@ -893,25 +893,26 @@ class OrderExecutor:
         self.clob = None
         if not CONFIG["DRY_RUN"] and CLOB_AVAILABLE and CONFIG["PRIVATE_KEY"]:
             try:
-                # ApiCreds requerido en py-clob-client >= 0.30 (ya no acepta dict)
-                creds = ApiCreds(
-                    api_key=CONFIG["API_KEY"],
-                    api_secret=CONFIG["API_SECRET"],
-                    api_passphrase=CONFIG["API_PASSPHRASE"],
-                ) if CONFIG["API_KEY"] else None
+                proxy = CONFIG["PROXY_ADDRESS"] or None
 
-                kwargs = dict(host=CLOB_API, chain_id=POLYGON, key=CONFIG["PRIVATE_KEY"])
-                if creds:
-                    kwargs["creds"] = creds
-                if CONFIG["PROXY_ADDRESS"]:
-                    kwargs["funder"] = CONFIG["PROXY_ADDRESS"]
+                # Inicializar cliente con clave y proxy (proxy wallet mode)
+                self.clob = ClobClient(
+                    host=CLOB_API,
+                    chain_id=POLYGON,
+                    key=CONFIG["PRIVATE_KEY"],
+                    funder=proxy,
+                )
 
-                self.clob = ClobClient(**kwargs)
-
-                # Si no tenemos creds, derivarlas del private key
-                if not creds:
-                    derived = self.clob.derive_api_key()
-                    self.clob.set_api_creds(self.clob.create_or_derive_api_creds())
+                # Configurar credenciales de API
+                if CONFIG["API_KEY"]:
+                    self.clob.set_api_creds(ApiCreds(
+                        api_key=CONFIG["API_KEY"],
+                        api_secret=CONFIG["API_SECRET"],
+                        api_passphrase=CONFIG["API_PASSPHRASE"],
+                    ))
+                else:
+                    # Derivar credenciales del private key (proxy wallet)
+                    self.clob.set_api_creds(self.clob.derive_api_key())
 
                 log.info("✅ CLOB conectado — modo REAL")
             except Exception as e:
