@@ -49,7 +49,7 @@ load_dotenv()
 CONFIG = {
     "ANTHROPIC_API_KEY":    os.getenv("ANTHROPIC_API_KEY", ""),
     "PRIVATE_KEY":          os.getenv("POLYMARKET_PRIVATE_KEY", ""),
-    "PROXY_ADDRESS":        os.getenv("POLYMARKET_PROXY_ADDRESS", ""),
+    "PROXY_ADDRESS":        os.getenv("POLYMARKET_PROXY_ADDRESS") or os.getenv("PROXY_ADDRESS", ""),
     "API_KEY":              os.getenv("POLYMARKET_API_KEY", ""),
     "API_SECRET":           os.getenv("POLYMARKET_API_SECRET", ""),
     "API_PASSPHRASE":       os.getenv("POLYMARKET_API_PASSPHRASE", ""),
@@ -895,6 +895,7 @@ class OrderExecutor:
         if not CONFIG["DRY_RUN"] and CLOB_AVAILABLE and CONFIG["PRIVATE_KEY"]:
             try:
                 proxy = CONFIG["PROXY_ADDRESS"] or None
+                log.info(f"CLOB init: funder={'proxy wallet ' + proxy[:10] + '...' if proxy else 'None (EOA directo)'}")
 
                 # Inicializar cliente con clave y proxy (proxy wallet mode)
                 self.clob = ClobClient(
@@ -912,8 +913,8 @@ class OrderExecutor:
                         api_passphrase=CONFIG["API_PASSPHRASE"],
                     ))
                 else:
-                    # Derivar credenciales del private key (proxy wallet)
-                    self.clob.set_api_creds(self.clob.derive_api_key())
+                    # create_or_derive_api_creds maneja correctamente proxy wallets
+                    self.clob.set_api_creds(self.clob.create_or_derive_api_creds())
 
                 log.info("✅ CLOB conectado — modo REAL")
             except Exception as e:
