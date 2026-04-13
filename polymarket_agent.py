@@ -416,10 +416,10 @@ class PolymarketScanner:
     def find_late_resolution(self, limit=200) -> list[Market]:
         """
         Busca mercados donde la fecha de resolución ya pasó pero siguen activos.
-        El token ganador está a >0.90 pero <0.99 = ganancia casi garantizada al resolver.
-        NO requiere Claude — lógica puramente mecánica.
+        Filtros estrictos: solo mercados recientes, líquidos y de fácil resolución.
+        Evita elecciones en países inestables, conflictos, golpes de estado, etc.
         """
-        from datetime import datetime
+        from datetime import datetime, timedelta
         try:
             resp = requests.get(
                 f"{GAMMA_API}/markets",
@@ -437,6 +437,15 @@ class PolymarketScanner:
         now = datetime.utcnow()
         opportunities = []
 
+        # Palabras clave de mercados problemáticos (resolución lenta/incierta)
+        risky_keywords = [
+            "election", "presidente", "president", "war", "conflict",
+            "coup", "military", "invasion", "regime", "parliament",
+            "prime minister", "governor", "senator", "congressional",
+            "guinea", "bissau", "venezuela", "myanmar", "sudan",
+            "assassination", "impeach",
+        ]
+
         for m in raw:
             try:
                 end_date = m.get("endDate", "")
@@ -444,19 +453,35 @@ class PolymarketScanner:
                     continue
                 end = datetime.fromisoformat(end_date.replace("Z", ""))
 
-                # Solo mercados donde la fecha ya pasó
+                # Filtro 1: Solo mercados que ya vencieron
                 if end > now:
+                    continue
+
+                # Filtro 2: Vencidos hace máximo 7 días
+                if (now - end).days > 7:
+                    continue
+
+                # Filtro 3: Liquidez mínima $5,000
+                liquidity = float(m.get("liquidity", 0) or 0)
+                if liquidity < 5000:
+                    continue
+
+                # Filtro 4: Volumen 24h > $0 (mercado activo, no abandonado)
+                volume_24h = float(m.get("volume24hr", 0) or 0)
+                if volume_24h == 0:
+                    continue
+
+                # Filtro 5: Evitar mercados de difícil/lenta resolución
+                question_lower = m.get("question", "").lower()
+                if any(kw in question_lower for kw in risky_keywords):
+                    log.debug(f"Late resolution descartado (risky): {question_lower[:60]}")
                     continue
 
                 outcomes = self._parse_outcomes(m)
                 if not outcomes:
                     continue
 
-                liquidity = float(m.get("liquidity", 0) or 0)
-                if liquidity < 1000:
-                    continue
-
-                # Buscar outcome con precio alto (>0.90) pero no resuelto (<0.99)
+                # Filtro 6: Al menos un outcome con precio claro (>0.90, <0.99)
                 for o in outcomes:
                     if 0.90 <= o["price"] <= 0.98:
                         opportunities.append(Market(
@@ -469,11 +494,12 @@ class PolymarketScanner:
                             outcomes=outcomes,
                             url=f"https://polymarket.com/event/{m.get('slug', '')}",
                         ))
-                        break  # solo uno por mercado
+                        break
+
             except Exception:
                 continue
 
-        log.info(f"Resolución tardía: {len(opportunities)} mercados encontrados")
+        log.info(f"Resolución tardía: {len(opportunities)} mercados encontrados (filtros estrictos)")
         return opportunities
 
     def find_correlated_arbitrage(self, markets: list[Market]) -> list[dict]:
