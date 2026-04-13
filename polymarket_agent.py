@@ -941,17 +941,15 @@ class OrderExecutor:
             return None
         else:
             # Exchange requiere mínimo $5 USDC por orden
-            if opp.bet_size_usd < 5.0:
-                log.warning(
-                    f"BUY saltado: apuesta ${opp.bet_size_usd:.2f} "
-                    f"< mínimo del exchange $5. Espera mayor edge o más bankroll."
-                )
-                return None
+            bet_size = opp.bet_size_usd
+            if bet_size < 5.0:
+                log.info(f"Apuesta ${bet_size:.2f} ajustada al mínimo del exchange $5")
+                bet_size = 5.0
             try:
                 order = OrderArgs(
                     token_id=opp.token_id,
                     price=round(opp.market_price + 0.001, 3),
-                    size=opp.bet_size_usd,
+                    size=bet_size,
                     side="BUY",
                 )
                 self.clob.create_and_post_order(order)
