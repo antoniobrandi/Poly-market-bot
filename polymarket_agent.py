@@ -411,6 +411,141 @@ class PolymarketScanner:
             return price if 0 < price < 1 else None
         except Exception:
             return None
+
+    def find_late_resolution(self, limit=200) -> list[Market]:
+        """
+        Busca mercados donde la fecha de resolución ya pasó pero siguen activos.
+        El token ganador está a >0.90 pero <0.99 = ganancia casi garantizada al resolver.
+        NO requiere Claude — lógica puramente mecánica.
+        """
+        from datetime import datetime
+        try:
+            resp = requests.get(
+                f"{GAMMA_API}/markets",
+                params={"active": "true", "limit": limit, "order": "endDate", "ascending": "true"},
+                timeout=20,
+                headers={"Accept": "application/json"}
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            raw = data if isinstance(data, list) else data.get("data", [])
+        except Exception as e:
+            log.error(f"Error buscando late resolution: {e}")
+            return []
+
+        now = datetime.utcnow()
+        opportunities = []
+
+        for m in raw:
+            try:
+                end_date = m.get("endDate", "")
+                if not end_date:
+                    continue
+                end = datetime.fromisoformat(end_date.replace("Z", ""))
+
+                # Solo mercados donde la fecha ya pasó
+                if end > now:
+                    continue
+
+                outcomes = self._parse_outcomes(m)
+                if not outcomes:
+                    continue
+
+                liquidity = float(m.get("liquidity", 0) or 0)
+                if liquidity < 1000:
+                    continue
+
+                # Buscar outcome con precio alto (>0.90) pero no resuelto (<0.99)
+                for o in outcomes:
+                    if 0.90 <= o["price"] <= 0.98:
+                        opportunities.append(Market(
+                            condition_id=m.get("conditionId", m.get("id", "")),
+                            question=m.get("question", ""),
+                            category="LATE_RESOLUTION",
+                            volume=float(m.get("volume", 0) or 0),
+                            liquidity=liquidity,
+                            end_date=end_date,
+                            outcomes=outcomes,
+                            url=f"https://polymarket.com/event/{m.get('slug', '')}",
+                        ))
+                        break  # solo uno por mercado
+            except Exception:
+                continue
+
+        log.info(f"Resolución tardía: {len(opportunities)} mercados encontrados")
+        return opportunities
+
+    def find_correlated_arbitrage(self, markets: list[Market]) -> list[dict]:
+        """
+        Busca pares de mercados relacionados con precios inconsistentes.
+        Ejemplo: 'X by April' a 40% y 'X by June' a 35% → el de junio está subvalorado.
+        NO requiere Claude — detección matemática.
+        """
+        from datetime import datetime
+
+        # Agrupar mercados por tema base (quitando fechas y números)
+        groups: dict[str, list[Market]] = {}
+        for m in markets:
+            topic = m.question.lower()
+            topic = re.sub(r'\bby\s+\w+\s*\d*\b', '', topic)
+            topic = re.sub(r'\bin\s+(january|february|march|april|may|june|july|august'
+                           r'|september|october|november|december)\b', '', topic)
+            topic = re.sub(r'\$[\d,]+', '', topic)
+            topic = re.sub(r'\d+%', '', topic)
+            topic = re.sub(r'\d{4}', '', topic)
+            topic = topic.strip()
+            key_words = sorted(w for w in topic.split() if len(w) > 3)
+            key = " ".join(key_words[:5])
+            if not key:
+                continue
+            groups.setdefault(key, []).append(m)
+
+        arb_opps = []
+
+        for group in groups.values():
+            if len(group) < 2:
+                continue
+
+            for i in range(len(group)):
+                for j in range(i + 1, len(group)):
+                    m1, m2 = group[i], group[j]
+                    try:
+                        end1 = datetime.fromisoformat(m1.end_date.replace("Z", ""))
+                        end2 = datetime.fromisoformat(m2.end_date.replace("Z", ""))
+                    except Exception:
+                        continue
+
+                    yes1 = next((o for o in m1.outcomes if o["name"].lower() == "yes"), None)
+                    yes2 = next((o for o in m2.outcomes if o["name"].lower() == "yes"), None)
+                    if not yes1 or not yes2:
+                        continue
+
+                    p1, p2 = yes1["price"], yes2["price"]
+
+                    # Deadline más lejano DEBE tener precio >= deadline más cercano
+                    if end2 > end1 and p2 < p1 - 0.05:
+                        arb_opps.append({
+                            "buy_market": m2, "buy_outcome": yes2,
+                            "spread": p1 - p2,
+                            "reasoning": (
+                                f"'{m2.question[:50]}' ({p2:.1%}) debería ser >= "
+                                f"'{m1.question[:50]}' ({p1:.1%}). Spread: {p1-p2:.1%}"
+                            ),
+                        })
+                    elif end1 > end2 and p1 < p2 - 0.05:
+                        arb_opps.append({
+                            "buy_market": m1, "buy_outcome": yes1,
+                            "spread": p2 - p1,
+                            "reasoning": (
+                                f"'{m1.question[:50]}' ({p1:.1%}) debería ser >= "
+                                f"'{m2.question[:50]}' ({p2:.1%}). Spread: {p2-p1:.1%}"
+                            ),
+                        })
+
+        arb_opps.sort(key=lambda x: x["spread"], reverse=True)
+        if arb_opps:
+            log.info(f"Arbitraje correlacionado: {len(arb_opps)} oportunidades encontradas")
+        return arb_opps
  
     def get_market_by_condition(self, condition_id: str) -> Optional[dict]:
         """Obtiene datos actuales de un mercado específico."""
@@ -982,8 +1117,87 @@ class PolymarketAgent:
         if slots <= 0:
             log.info("Posiciones al máximo. Solo monitoreando.")
             return
- 
-        markets = self.scanner.get_active_markets()
+
+        # ── ESTRATEGIA A: Resolución tardía (GRATIS — sin Claude) ────────────
+        late_markets = self.scanner.find_late_resolution()
+        for m in late_markets[:3]:
+            if slots <= 0:
+                break
+            if m.condition_id in self.state.analyzed_today:
+                continue
+            if any(p.market_condition_id == m.condition_id for p in self.state.open_positions):
+                continue
+            best = max(m.outcomes, key=lambda o: o["price"])
+            if best["price"] < 0.90:
+                continue
+            bet_size = max(CONFIG["MIN_BET_USD"], min(3.0, self.state.bankroll * 0.05))
+            if self.state.bankroll < bet_size + 5:
+                continue
+            expected_profit_pct = ((1.0 / best["price"]) - 1) * 100
+            log.info(
+                f"LATE RESOLUTION: '{m.question[:60]}' | "
+                f"{best['name']} @ {best['price']:.3f} | "
+                f"Ganancia esperada: +{expected_profit_pct:.1f}% | Apuesta: ${bet_size:.2f}"
+            )
+            opp = Opportunity(
+                market=m,
+                outcome_name=best["name"],
+                token_id=best["token_id"],
+                market_price=best["price"],
+                ai_probability=0.95,
+                edge=round(1.0 - best["price"], 4),
+                kelly_fraction=0.05,
+                bet_size_usd=bet_size,
+                reasoning=f"Late resolution: mercado ya venció, {best['name']} a {best['price']:.3f}",
+                confidence="HIGH",
+            )
+            position = self.executor.buy(opp)
+            if position:
+                self.state.bankroll -= bet_size
+                self.state.open_positions.append(position)
+                slots -= 1
+                log.info("  Posición de resolución tardía abierta")
+            self.state.analyzed_today.add(m.condition_id)
+
+        # ── ESTRATEGIA B: Arbitraje correlacionado (GRATIS — sin Claude) ─────
+        all_markets_raw = self.scanner.get_active_markets()
+        all_markets_filtered = self.scanner.filter_markets(all_markets_raw)
+        arb_opps = self.scanner.find_correlated_arbitrage(all_markets_filtered)
+        for arb in arb_opps[:2]:
+            if slots <= 0:
+                break
+            buy_m = arb["buy_market"]
+            buy_o = arb["buy_outcome"]
+            if buy_m.condition_id in self.state.analyzed_today:
+                continue
+            if any(p.market_condition_id == buy_m.condition_id for p in self.state.open_positions):
+                continue
+            bet_size = max(CONFIG["MIN_BET_USD"], min(3.0, self.state.bankroll * 0.05))
+            if self.state.bankroll < bet_size + 5:
+                continue
+            log.info(f"ARBITRAJE: {arb['reasoning']}")
+            opp = Opportunity(
+                market=buy_m,
+                outcome_name=buy_o["name"],
+                token_id=buy_o["token_id"],
+                market_price=buy_o["price"],
+                ai_probability=min(0.99, buy_o["price"] + arb["spread"]),
+                edge=arb["spread"],
+                kelly_fraction=0.05,
+                bet_size_usd=bet_size,
+                reasoning=arb["reasoning"],
+                confidence="HIGH",
+            )
+            position = self.executor.buy(opp)
+            if position:
+                self.state.bankroll -= bet_size
+                self.state.open_positions.append(position)
+                slots -= 1
+                log.info("  Posición de arbitraje abierta")
+            self.state.analyzed_today.add(buy_m.condition_id)
+
+        # ── ESTRATEGIA C: Edge con IA ─────────────────────────────────────────
+        markets = all_markets_raw  # reusar los ya descargados
         markets = self.scanner.filter_markets(markets)            # Fase 1: filtros de código (gratis)
         markets = self.scanner.deduplicate_markets(markets)       # Eliminar variaciones del mismo evento
 
