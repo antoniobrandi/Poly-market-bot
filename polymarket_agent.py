@@ -898,11 +898,14 @@ class OrderExecutor:
                 log.info(f"CLOB init: funder={'proxy wallet ' + proxy[:10] + '...' if proxy else 'None (EOA directo)'}")
 
                 # Inicializar cliente con clave y proxy (proxy wallet mode)
+                # signature_type=1 (POLY_PROXY) requerido para proxies MetaMask
+                # signature_type=None→0 (EOA) para modo directo sin proxy
                 self.clob = ClobClient(
                     host=CLOB_API,
                     chain_id=POLYGON,
                     key=CONFIG["PRIVATE_KEY"],
                     funder=proxy,
+                    signature_type=1 if proxy else None,
                 )
 
                 # Configurar credenciales de API
