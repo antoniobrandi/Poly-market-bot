@@ -928,23 +928,22 @@ class OrderExecutor:
     def buy(self, opp: Opportunity) -> Optional[Position]:
         """Ejecuta orden de compra y devuelve la posición creada."""
         import uuid
-        shares = opp.bet_size_usd / opp.market_price
- 
+        # Exchange mínimo $5 USDC — ajustar si Kelly da menos
+        bet_size = max(opp.bet_size_usd, 5.0)
+        shares = bet_size / opp.market_price
+
         if CONFIG["DRY_RUN"]:
             log.info(
                 f"[DRY RUN] 🟢 BUY '{opp.outcome_name}' @ {opp.market_price:.3f} "
-                f"| ${opp.bet_size_usd} → {shares:.2f} shares "
+                f"| ${bet_size} → {shares:.2f} shares "
                 f"| Edge: +{opp.edge*100:.1f}% | Conf: {opp.confidence}"
             )
         elif self.clob is None:
             log.error("BUY abortado: CLOB no inicializado (revisa PRIVATE_KEY y conexión)")
             return None
         else:
-            # Exchange requiere mínimo $5 USDC por orden
-            bet_size = opp.bet_size_usd
-            if bet_size < 5.0:
-                log.info(f"Apuesta ${bet_size:.2f} ajustada al mínimo del exchange $5")
-                bet_size = 5.0
+            if bet_size > opp.bet_size_usd:
+                log.info(f"Apuesta ${opp.bet_size_usd:.2f} ajustada al mínimo del exchange $5")
             try:
                 order = OrderArgs(
                     token_id=opp.token_id,
@@ -963,7 +962,7 @@ class OrderExecutor:
             market_question=opp.market.question,
             outcome=opp.outcome_name,
             token_id=opp.token_id,
-            size_usd=opp.bet_size_usd,
+            size_usd=bet_size,
             shares=shares,
             entry_price=opp.market_price,
             ai_probability=opp.ai_probability,
