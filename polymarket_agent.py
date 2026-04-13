@@ -49,6 +49,7 @@ load_dotenv()
 CONFIG = {
     "ANTHROPIC_API_KEY":    os.getenv("ANTHROPIC_API_KEY", ""),
     "PRIVATE_KEY":          os.getenv("POLYMARKET_PRIVATE_KEY", ""),
+    "PROXY_ADDRESS":        os.getenv("POLYMARKET_PROXY_ADDRESS", ""),
     "API_KEY":              os.getenv("POLYMARKET_API_KEY", ""),
     "API_SECRET":           os.getenv("POLYMARKET_API_SECRET", ""),
     "API_PASSPHRASE":       os.getenv("POLYMARKET_API_PASSPHRASE", ""),
