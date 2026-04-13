@@ -940,6 +940,13 @@ class OrderExecutor:
             log.error("BUY abortado: CLOB no inicializado (revisa PRIVATE_KEY y conexión)")
             return None
         else:
+            # Exchange requiere mínimo $5 USDC por orden
+            if opp.bet_size_usd < 5.0:
+                log.warning(
+                    f"BUY saltado: apuesta ${opp.bet_size_usd:.2f} "
+                    f"< mínimo del exchange $5. Espera mayor edge o más bankroll."
+                )
+                return None
             try:
                 order = OrderArgs(
                     token_id=opp.token_id,
