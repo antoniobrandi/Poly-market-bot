@@ -926,12 +926,15 @@ class OrderExecutor:
         import uuid
         shares = opp.bet_size_usd / opp.market_price
  
-        if CONFIG["DRY_RUN"] or self.clob is None:
+        if CONFIG["DRY_RUN"]:
             log.info(
                 f"[DRY RUN] 🟢 BUY '{opp.outcome_name}' @ {opp.market_price:.3f} "
                 f"| ${opp.bet_size_usd} → {shares:.2f} shares "
                 f"| Edge: +{opp.edge*100:.1f}% | Conf: {opp.confidence}"
             )
+        elif self.clob is None:
+            log.error("BUY abortado: CLOB no inicializado (revisa PRIVATE_KEY y conexión)")
+            return None
         else:
             try:
                 order = OrderArgs(
@@ -968,13 +971,16 @@ class OrderExecutor:
         pnl_usd  = received - position.size_usd
         pnl_pct  = pnl_usd / position.size_usd * 100
  
-        if CONFIG["DRY_RUN"] or self.clob is None:
+        if CONFIG["DRY_RUN"]:
             log.info(
                 f"[DRY RUN] {'🟢' if pnl_usd >= 0 else '🔴'} SELL '{position.outcome}' "
                 f"@ {current_price:.3f} | Recibido: ${received:.2f} | "
                 f"PnL: {'+'if pnl_usd>=0 else ''}{pnl_usd:.2f} ({pnl_pct:+.1f}%)"
             )
             return received
+        elif self.clob is None:
+            log.error("SELL abortado: CLOB no inicializado")
+            return position.size_usd  # devolver lo invertido como fallback seguro
  
         try:
             order = OrderArgs(
@@ -1132,12 +1138,13 @@ class PolymarketAgent:
             return
 
         # ── ESTRATEGIA A: Resolución tardía (GRATIS — sin Claude) ────────────
+        # No usa analyzed_today: mercados pueden permanecer sin resolver varios días,
+        # y necesitamos poder reentrar si la posición anterior ya se cerró.
         late_markets = self.scanner.find_late_resolution()
         for m in late_markets[:3]:
             if slots <= 0:
                 break
-            if m.condition_id in self.state.analyzed_today:
-                continue
+            # Solo bloquear si ya tenemos posición ABIERTA en este mercado
             if any(p.market_condition_id == m.condition_id for p in self.state.open_positions):
                 continue
             best = max(m.outcomes, key=lambda o: o["price"])
@@ -1170,7 +1177,6 @@ class PolymarketAgent:
                 self.state.open_positions.append(position)
                 slots -= 1
                 log.info("  Posición de resolución tardía abierta")
-            self.state.analyzed_today.add(m.condition_id)
 
         # ── ESTRATEGIA B: Arbitraje correlacionado (GRATIS — sin Claude) ─────
         all_markets_raw = self.scanner.get_active_markets()
