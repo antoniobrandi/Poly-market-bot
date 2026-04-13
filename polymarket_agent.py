@@ -1095,9 +1095,6 @@ class PolymarketAgent:
         saved = StatePersistence.load()
         if saved:
             self.state = saved
-            # Limpiar analyzed_today en cada reinicio: pre-filter ya filtra (~$0.01),
-            # no tiene sentido bloquear análisis profundo de sesiones anteriores.
-            self.state.analyzed_today = set()
             log.info("✅ Estado previo restaurado")
         else:
             self.state = AgentState(
