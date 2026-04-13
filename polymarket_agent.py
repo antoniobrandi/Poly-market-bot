@@ -19,6 +19,7 @@ REQUISITOS:
 """
  
 import os
+import re
 import sys
 import json
 import time
@@ -362,7 +363,40 @@ class PolymarketScanner:
             filtered.append(m)
         log.info(f"Mercados tras filtro fase 1: {len(filtered)}")
         return filtered
- 
+
+    def deduplicate_markets(self, markets: list[Market]) -> list[Market]:
+        """Elimina mercados que son variaciones del mismo evento (ej: 'X by April 15' y 'X by April 30')."""
+        seen_topics = []
+        unique = []
+
+        for m in markets:
+            # Extraer el tema base quitando fechas y thresholds numéricos
+            topic = m.question.lower()
+            topic = re.sub(r'\bby\s+\w+\s*\d*\b', '', topic)
+            topic = re.sub(r'\bin\s+(january|february|march|april|may|june|july|august|september|october|november|december)\b', '', topic)
+            topic = re.sub(r'\bin\s+\d{4}\b', '', topic)
+            topic = re.sub(r'\$[\d,]+', '', topic)
+            topic = re.sub(r'\d+%', '', topic)
+            topic = topic.strip()
+
+            is_duplicate = False
+            topic_words = set(topic.split())
+            if len(topic_words) >= 3:
+                for seen in seen_topics:
+                    seen_words = set(seen.split())
+                    overlap = len(topic_words & seen_words) / max(len(topic_words), len(seen_words))
+                    if overlap > 0.70:  # 70% de palabras en común = probable duplicado
+                        is_duplicate = True
+                        break
+
+            if not is_duplicate:
+                seen_topics.append(topic)
+                unique.append(m)
+
+        if len(unique) < len(markets):
+            log.info(f"Deduplicación: {len(markets)} → {len(unique)} mercados únicos")
+        return unique
+
     def get_token_price(self, token_id: str) -> Optional[float]:
         """Obtiene el precio actual de un token específico."""
         try:
@@ -561,10 +595,10 @@ RESPONDE SOLO EN JSON:
 
     def pre_filter_markets(self, markets: list[Market]) -> list[Market]:
         """
-        Fase 2: Pre-filtro barato usando Claude SIN web search.
-        Manda todos los mercados que pasaron la Fase 1 en UN solo llamado.
-        Claude elige los mas prometedores solo leyendo la pregunta y precios.
-        Costo: ~$0.01 por ciclo en lugar de $0.08 x N.
+        Fase 2: Claude identifica mercados ineficientes SIN web search (~$0.01).
+        Usa criterios explícitos de edge real: info asimétrica, sesgo de mercado,
+        precio irracional. Si no hay ninguno prometedor, devuelve [] y se salta
+        el análisis profundo (ahorra ~$0.40).
         """
         if not markets:
             return []
@@ -576,73 +610,70 @@ RESPONDE SOLO EN JSON:
             log.info(f"Pre-filtro fase 2: solo {len(markets)} mercados, saltando llamado batch")
             return markets
 
-        # Construir prompt con todos los mercados en una sola lista
-        market_lines = []
+        # Construir resumen de cada mercado
+        summaries = []
         for i, m in enumerate(markets):
-            prices_str = ", ".join(
-                f"{o['name']}={o['price']:.2f}" for o in m.outcomes
-            )
-            market_lines.append(
-                f"{i+1}. [{m.condition_id}] {m.question} | "
-                f"Precios: {prices_str} | Vol: ${m.volume:,.0f} | Liq: ${m.liquidity:,.0f}"
+            prices = ", ".join(f"{o['name']}={o['price']:.3f}" for o in m.outcomes)
+            summaries.append(
+                f"{i+1}. \"{m.question}\" | Cat: {m.category} | "
+                f"Vol: ${m.volume:,.0f} | Liq: ${m.liquidity:,.0f} | "
+                f"{prices} | Resuelve: {m.end_date[:10]}"
             )
 
-        markets_text = "\n".join(market_lines)
-        example_id1 = markets[0].condition_id
-        example_id2 = markets[1].condition_id if len(markets) > 1 else "xxx"
+        prompt = f"""Eres un trader experto en mercados de predicción buscando EDGE REAL — mercados donde el precio NO refleja la probabilidad verdadera.
 
-        prompt = (
-            f"Eres un analista de mercados de prediccion. Tienes {len(markets)} mercados activos de Polymarket.\n\n"
-            f"Tu tarea: identificar los {top_n} mercados con MAS PROBABILIDAD de tener un precio EQUIVOCADO ahora mismo.\n\n"
-            f"Busca:\n"
-            f"- Mercados sobre eventos proximos donde las noticias recientes pueden haber cambiado la probabilidad real\n"
-            f"- Mercados con precios entre 0.25-0.75 (mas margen para mispricing)\n"
-            f"- Mercados sobre temas donde el sentimiento publico se retrasa respecto a la realidad\n"
-            f"- Mercados con preguntas especificas y verificables\n"
-            f"- Evita mercados sobre temas sin desarrollos recientes\n\n"
-            f"MERCADOS:\n{markets_text}\n\n"
-            f"Devuelve SOLO un array JSON con los condition_ids de los {top_n} mejores mercados, en orden de prioridad.\n"
-            f'Ejemplo: ["{example_id1}", "{example_id2}"]\n\n'
-            f"SOLO el array JSON, sin texto adicional."
-        )
+MERCADOS DISPONIBLES:
+{chr(10).join(summaries)}
+
+CRITERIOS PARA SELECCIONAR (busca estos patrones):
+1. INFORMACIÓN ASIMÉTRICA — ¿Sabes algo que el precio no refleja? (decisiones ya anunciadas, datos públicos ignorados, tendencias claras)
+2. SESGO DE MERCADO — ¿El precio refleja opinión popular en vez de probabilidad real? (mercados emocionales, hype, miedo)
+3. RESOLUCIÓN CLARA — ¿Puedes estimar la probabilidad real con confianza >70%?
+4. PRECIO IRRACIONAL — ¿El precio está claramente fuera de rango lógico?
+
+CRITERIOS PARA DESCARTAR:
+- Deportes donde casas de apuestas ya tienen el precio correcto
+- Mercados de "¿llegará X precio?" en crypto/commodities (traders pro dominan)
+- Mercados donde genuinamente no tienes información para estimar mejor que el mercado
+- Si no estás seguro, NO lo incluyas
+
+Sé muy selectivo. Es mejor devolver 0-2 mercados realmente buenos que 5 mediocres.
+
+RESPONDE SOLO EN JSON:
+{{"promising": [1, 5], "reasoning": "breve explicación de por qué cada uno"}}
+
+Si NINGUNO tiene edge real: {{"promising": [], "reasoning": "ninguno presenta oportunidad clara"}}"""
 
         try:
             response = self.client.messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=500,
+                max_tokens=400,
                 messages=[{"role": "user", "content": prompt}]
-                # SIN tools= -> sin web search -> muy barato (~$0.01)
+                # SIN tools= → sin web search → muy barato (~$0.01)
             )
             text = "".join(b.text for b in response.content if b.type == "text").strip()
+            result = self._parse_json(text)
 
-            # Parsear el array JSON de condition_ids
-            start = text.find("[")
-            end = text.rfind("]") + 1
-            if start == -1 or end == 0:
-                log.warning("Pre-filtro fase 2: no se pudo parsear respuesta, usando top por volumen")
+            if not result or "promising" not in result:
+                log.warning("Pre-filtro fase 2: respuesta no parseable, usando top por score")
                 return markets[:top_n]
 
-            selected_ids = json.loads(text[start:end])
-            if not isinstance(selected_ids, list):
-                log.warning("Pre-filtro fase 2: respuesta no es lista, usando top por volumen")
-                return markets[:top_n]
+            indices = [int(x) - 1 for x in result["promising"]
+                       if str(x).isdigit() and 0 < int(x) <= len(markets)]
+            reasoning = result.get("reasoning", "")
 
-            # Reconstruir lista en el orden que eligio Claude
-            market_map = {m.condition_id: m for m in markets}
-            result = []
-            for cid in selected_ids:
-                cid_str = str(cid).strip()
-                if cid_str in market_map and market_map[cid_str] not in result:
-                    result.append(market_map[cid_str])
+            # Respetar decisión de Claude: si devuelve [], saltamos Phase 3 completamente
+            if not indices:
+                log.info(f"Pre-filtro fase 2: Claude no encontró edge real — saltando análisis profundo")
+                if reasoning:
+                    log.info(f"   Razón: {reasoning[:200]}")
+                return []
 
-            if not result:
-                log.warning("Pre-filtro fase 2: ningun ID coincidio, usando top por volumen")
-                return markets[:top_n]
-
-            log.info(
-                f"Pre-filtro fase 2: {len(markets)} -> {len(result)} mercados seleccionados por Claude (sin web search)"
-            )
-            return result
+            chosen = [markets[i] for i in indices]
+            log.info(f"Pre-filtro fase 2: {len(markets)} → {len(chosen)} mercados prometedores (~$0.01)")
+            if reasoning:
+                log.info(f"   Razón: {reasoning[:200]}")
+            return chosen
 
         except Exception as e:
             log.error(f"Error en pre_filter_markets: {e}")
@@ -954,8 +985,31 @@ class PolymarketAgent:
  
         markets = self.scanner.get_active_markets()
         markets = self.scanner.filter_markets(markets)            # Fase 1: filtros de código (gratis)
-        markets.sort(key=lambda m: m.volume, reverse=True)
-        markets = markets[:CONFIG["PRE_FILTER_BATCH_SIZE"]]       # cap: hasta 40 al pre-filtro
+        markets = self.scanner.deduplicate_markets(markets)       # Eliminar variaciones del mismo evento
+
+        # Scoring inteligente: priorizar volumen MEDIO y categorías nicho
+        def edge_score(m: Market) -> float:
+            vol = m.volume
+            if vol > 500_000:   vol_score = 0.2   # demasiado popular, bien preciado
+            elif vol > 100_000: vol_score = 0.5
+            elif vol > 25_000:  vol_score = 1.0   # sweet spot
+            elif vol > 5_000:   vol_score = 0.8
+            else:               vol_score = 0.3
+
+            category_bonus = {
+                "Politics": 1.3, "Science": 1.4, "Technology": 1.3,
+                "Economics": 1.2, "Crypto": 0.6, "Sports": 0.5, "Pop Culture": 0.9,
+            }
+            cat_score = category_bonus.get(m.category, 1.0)
+
+            best_dist = min(abs(o["price"] - 0.5) for o in m.outcomes) if m.outcomes else 0.5
+            uncertainty_score = 1.0 + (0.5 - best_dist)  # más cercano a 0.50 = más potencial
+
+            return vol_score * cat_score * uncertainty_score
+
+        markets.sort(key=edge_score, reverse=True)
+        log.info(f"Top categorías: {[m.category for m in markets[:5]]}")  # para calibrar bonuses
+        markets = markets[:20]                                    # cap: 20 al pre-filtro
         markets = self.analyzer.pre_filter_markets(markets)       # Fase 2: Claude sin web search (~$0.01)
         markets = markets[:CONFIG["MAX_MARKETS_PER_RUN"]]         # Fase 3: análisis profundo con web search
  
