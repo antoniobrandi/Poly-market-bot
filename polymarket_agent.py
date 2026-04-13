@@ -34,7 +34,7 @@ import requests
  
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, Side
+    from py_clob_client.clob_types import OrderArgs
     from py_clob_client.constants import POLYGON
     CLOB_AVAILABLE = True
 except ImportError:
