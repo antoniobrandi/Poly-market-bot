@@ -19,6 +19,7 @@ REQUISITOS:
 """
  
 import os
+import re
 import sys
 import json
 import time
@@ -33,7 +34,7 @@ import requests
  
 try:
     from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs
+    from py_clob_client.clob_types import OrderArgs, ApiCreds
     from py_clob_client.constants import POLYGON
     CLOB_AVAILABLE = True
 except ImportError:
@@ -48,7 +49,7 @@ load_dotenv()
 CONFIG = {
     "ANTHROPIC_API_KEY":    os.getenv("ANTHROPIC_API_KEY", ""),
     "PRIVATE_KEY":          os.getenv("POLYMARKET_PRIVATE_KEY", ""),
-    "PROXY_ADDRESS":        os.getenv("POLYMARKET_PROXY_ADDRESS", ""),
+    "PROXY_ADDRESS":        os.getenv("POLYMARKET_PROXY_ADDRESS") or os.getenv("PROXY_ADDRESS", ""),
     "API_KEY":              os.getenv("POLYMARKET_API_KEY", ""),
     "API_SECRET":           os.getenv("POLYMARKET_API_SECRET", ""),
     "API_PASSPHRASE":       os.getenv("POLYMARKET_API_PASSPHRASE", ""),
@@ -81,6 +82,8 @@ CONFIG = {
     # ── Operación ───────────────────────────────────────────
     "SCAN_INTERVAL_MIN":    int(os.getenv("SCAN_INTERVAL_MIN", "60")),
     "MAX_MARKETS_PER_RUN":  int(os.getenv("MAX_MARKETS_PER_RUN", "5")),
+    "PRE_FILTER_BATCH_SIZE": int(os.getenv("PRE_FILTER_BATCH_SIZE", "40")),  # max mercados al pre-filtro
+    "PRE_FILTER_TOP_N":      int(os.getenv("PRE_FILTER_TOP_N", "5")),        # cuántos pasan a análisis profundo
     "DRY_RUN":              os.getenv("DRY_RUN", "true").lower() == "true",
     "STATE_FILE":           "agent_state.json",
     "LOG_FILE":             "polymarket_agent.log",
@@ -292,29 +295,43 @@ class PolymarketScanner:
  
     def _parse_outcomes(self, m: dict) -> list[dict]:
         outcomes = []
-        names = m.get("outcomes", [])
-        prices = m.get("outcomePrices", [])
-        token_ids = m.get("clobTokenIds", [])
-        if isinstance(names, str):
-            try: names = json.loads(names)
-            except: names = []
-        if isinstance(prices, str):
-            try: prices = json.loads(prices)
-            except: prices = []
-        if isinstance(token_ids, str):
-            try: token_ids = json.loads(token_ids)
-            except: token_ids = []
-        for i, name in enumerate(names):
+
+        # Formato nuevo: outcomes/outcomePrices/clobTokenIds son strings JSON
+        raw_names   = m.get("outcomes", "[]")
+        raw_prices  = m.get("outcomePrices", "[]")
+        raw_token_ids = m.get("clobTokenIds", "[]")
+        if isinstance(raw_names, str):
             try:
-                price = float(prices[i]) if i < len(prices) else 0
-                tid = token_ids[i] if i < len(token_ids) else ""
-                if 0.01 <= price <= 0.99 and tid:
+                names     = json.loads(raw_names)
+                prices    = json.loads(raw_prices)
+                token_ids = json.loads(raw_token_ids)
+                for i, name in enumerate(names):
+                    try:
+                        price = float(prices[i]) if i < len(prices) else 0
+                        if 0.01 <= price <= 0.99:
+                            outcomes.append({
+                                "name": name,
+                                "token_id": token_ids[i] if i < len(token_ids) else "",
+                                "price": price,
+                            })
+                    except Exception:
+                        continue
+                if outcomes:
+                    return outcomes
+            except Exception:
+                pass
+
+        # Formato anterior: tokens es una lista de objetos
+        for t in m.get("tokens", []):
+            try:
+                price = float(t.get("price", 0))
+                if 0.01 <= price <= 0.99:
                     outcomes.append({
-                        "name": name,
-                        "token_id": tid,
+                        "name": t.get("outcome", ""),
+                        "token_id": t.get("tokenId", ""),
                         "price": price,
                     })
-            except (ValueError, IndexError):
+            except Exception:
                 continue
         return outcomes
  
@@ -331,10 +348,56 @@ class PolymarketScanner:
                 if days_left < 2 or days_left > 90: continue
             except Exception:
                 continue
+
+            # Fase 1a: Rango de precios — descartar si todos los outcomes son extremos
+            # Mercados a 0.95/0.05 ya están decididos, hay poco edge
+            prices = [o["price"] for o in m.outcomes]
+            if not any(0.15 <= p <= 0.85 for p in prices):
+                continue
+
+            # Fase 1b: Integridad binaria — en mercados Yes/No los precios deben sumar ~1.0
+            if len(m.outcomes) == 2:
+                price_sum = sum(o["price"] for o in m.outcomes)
+                if abs(price_sum - 1.0) > 0.05:
+                    continue
+
             filtered.append(m)
-        log.info(f"Mercados tras filtro: {len(filtered)}")
+        log.info(f"Mercados tras filtro fase 1: {len(filtered)}")
         return filtered
- 
+
+    def deduplicate_markets(self, markets: list[Market]) -> list[Market]:
+        """Elimina mercados que son variaciones del mismo evento (ej: 'X by April 15' y 'X by April 30')."""
+        seen_topics = []
+        unique = []
+
+        for m in markets:
+            # Extraer el tema base quitando fechas y thresholds numéricos
+            topic = m.question.lower()
+            topic = re.sub(r'\bby\s+\w+\s*\d*\b', '', topic)
+            topic = re.sub(r'\bin\s+(january|february|march|april|may|june|july|august|september|october|november|december)\b', '', topic)
+            topic = re.sub(r'\bin\s+\d{4}\b', '', topic)
+            topic = re.sub(r'\$[\d,]+', '', topic)
+            topic = re.sub(r'\d+%', '', topic)
+            topic = topic.strip()
+
+            is_duplicate = False
+            topic_words = set(topic.split())
+            if len(topic_words) >= 3:
+                for seen in seen_topics:
+                    seen_words = set(seen.split())
+                    overlap = len(topic_words & seen_words) / max(len(topic_words), len(seen_words))
+                    if overlap > 0.70:  # 70% de palabras en común = probable duplicado
+                        is_duplicate = True
+                        break
+
+            if not is_duplicate:
+                seen_topics.append(topic)
+                unique.append(m)
+
+        if len(unique) < len(markets):
+            log.info(f"Deduplicación: {len(markets)} → {len(unique)} mercados únicos")
+        return unique
+
     def get_token_price(self, token_id: str) -> Optional[float]:
         """Obtiene el precio actual de un token específico."""
         try:
@@ -349,6 +412,167 @@ class PolymarketScanner:
             return price if 0 < price < 1 else None
         except Exception:
             return None
+
+    def find_late_resolution(self, limit=200) -> list[Market]:
+        """
+        Busca mercados donde la fecha de resolución ya pasó pero siguen activos.
+        Filtros estrictos: solo mercados recientes, líquidos y de fácil resolución.
+        Evita elecciones en países inestables, conflictos, golpes de estado, etc.
+        """
+        from datetime import datetime, timedelta
+        try:
+            resp = requests.get(
+                f"{GAMMA_API}/markets",
+                params={"active": "true", "limit": limit, "order": "endDate", "ascending": "true"},
+                timeout=20,
+                headers={"Accept": "application/json"}
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            raw = data if isinstance(data, list) else data.get("data", [])
+        except Exception as e:
+            log.error(f"Error buscando late resolution: {e}")
+            return []
+
+        now = datetime.utcnow()
+        opportunities = []
+
+        # Palabras clave de mercados problemáticos (resolución lenta/incierta)
+        risky_keywords = [
+            "election", "presidente", "president", "war", "conflict",
+            "coup", "military", "invasion", "regime", "parliament",
+            "prime minister", "governor", "senator", "congressional",
+            "guinea", "bissau", "venezuela", "myanmar", "sudan",
+            "assassination", "impeach",
+        ]
+
+        for m in raw:
+            try:
+                end_date = m.get("endDate", "")
+                if not end_date:
+                    continue
+                end = datetime.fromisoformat(end_date.replace("Z", ""))
+
+                # Filtro 1: Solo mercados que ya vencieron
+                if end > now:
+                    continue
+
+                # Filtro 2: Vencidos hace máximo 7 días
+                if (now - end).days > 7:
+                    continue
+
+                # Filtro 3: Liquidez mínima $5,000
+                liquidity = float(m.get("liquidity", 0) or 0)
+                if liquidity < 5000:
+                    continue
+
+                # Filtro 4: Volumen 24h > $0 (mercado activo, no abandonado)
+                volume_24h = float(m.get("volume24hr", 0) or 0)
+                if volume_24h == 0:
+                    continue
+
+                # Filtro 5: Evitar mercados de difícil/lenta resolución
+                question_lower = m.get("question", "").lower()
+                if any(kw in question_lower for kw in risky_keywords):
+                    log.debug(f"Late resolution descartado (risky): {question_lower[:60]}")
+                    continue
+
+                outcomes = self._parse_outcomes(m)
+                if not outcomes:
+                    continue
+
+                # Filtro 6: Al menos un outcome con precio claro (>0.90, <0.99)
+                for o in outcomes:
+                    if 0.90 <= o["price"] <= 0.98:
+                        opportunities.append(Market(
+                            condition_id=m.get("conditionId", m.get("id", "")),
+                            question=m.get("question", ""),
+                            category="LATE_RESOLUTION",
+                            volume=float(m.get("volume", 0) or 0),
+                            liquidity=liquidity,
+                            end_date=end_date,
+                            outcomes=outcomes,
+                            url=f"https://polymarket.com/event/{m.get('slug', '')}",
+                        ))
+                        break
+
+            except Exception:
+                continue
+
+        log.info(f"Resolución tardía: {len(opportunities)} mercados encontrados (filtros estrictos)")
+        return opportunities
+
+    def find_correlated_arbitrage(self, markets: list[Market]) -> list[dict]:
+        """
+        Busca pares de mercados relacionados con precios inconsistentes.
+        Ejemplo: 'X by April' a 40% y 'X by June' a 35% → el de junio está subvalorado.
+        NO requiere Claude — detección matemática.
+        """
+        from datetime import datetime
+
+        # Agrupar mercados por tema base (quitando fechas y números)
+        groups: dict[str, list[Market]] = {}
+        for m in markets:
+            topic = m.question.lower()
+            topic = re.sub(r'\bby\s+\w+\s*\d*\b', '', topic)
+            topic = re.sub(r'\bin\s+(january|february|march|april|may|june|july|august'
+                           r'|september|october|november|december)\b', '', topic)
+            topic = re.sub(r'\$[\d,]+', '', topic)
+            topic = re.sub(r'\d+%', '', topic)
+            topic = re.sub(r'\d{4}', '', topic)
+            topic = topic.strip()
+            key_words = sorted(w for w in topic.split() if len(w) > 3)
+            key = " ".join(key_words[:5])
+            if not key:
+                continue
+            groups.setdefault(key, []).append(m)
+
+        arb_opps = []
+
+        for group in groups.values():
+            if len(group) < 2:
+                continue
+
+            for i in range(len(group)):
+                for j in range(i + 1, len(group)):
+                    m1, m2 = group[i], group[j]
+                    try:
+                        end1 = datetime.fromisoformat(m1.end_date.replace("Z", ""))
+                        end2 = datetime.fromisoformat(m2.end_date.replace("Z", ""))
+                    except Exception:
+                        continue
+
+                    yes1 = next((o for o in m1.outcomes if o["name"].lower() == "yes"), None)
+                    yes2 = next((o for o in m2.outcomes if o["name"].lower() == "yes"), None)
+                    if not yes1 or not yes2:
+                        continue
+
+                    p1, p2 = yes1["price"], yes2["price"]
+
+                    # Deadline más lejano DEBE tener precio >= deadline más cercano
+                    if end2 > end1 and p2 < p1 - 0.05:
+                        arb_opps.append({
+                            "buy_market": m2, "buy_outcome": yes2,
+                            "spread": p1 - p2,
+                            "reasoning": (
+                                f"'{m2.question[:50]}' ({p2:.1%}) debería ser >= "
+                                f"'{m1.question[:50]}' ({p1:.1%}). Spread: {p1-p2:.1%}"
+                            ),
+                        })
+                    elif end1 > end2 and p1 < p2 - 0.05:
+                        arb_opps.append({
+                            "buy_market": m1, "buy_outcome": yes1,
+                            "spread": p2 - p1,
+                            "reasoning": (
+                                f"'{m1.question[:50]}' ({p1:.1%}) debería ser >= "
+                                f"'{m2.question[:50]}' ({p2:.1%}). Spread: {p2-p1:.1%}"
+                            ),
+                        })
+
+        arb_opps.sort(key=lambda x: x["spread"], reverse=True)
+        if arb_opps:
+            log.info(f"Arbitraje correlacionado: {len(arb_opps)} oportunidades encontradas")
+        return arb_opps
  
     def get_market_by_condition(self, condition_id: str) -> Optional[dict]:
         """Obtiene datos actuales de un mercado específico."""
@@ -530,6 +754,93 @@ RESPONDE SOLO EN JSON:
         return round(min(max(raw, CONFIG["MIN_BET_USD"]),
                          CONFIG["MAX_BET_USD"],
                          max_by_pct), 2)
+
+    def pre_filter_markets(self, markets: list[Market]) -> list[Market]:
+        """
+        Fase 2: Claude identifica mercados ineficientes SIN web search (~$0.01).
+        Usa criterios explícitos de edge real: info asimétrica, sesgo de mercado,
+        precio irracional. Si no hay ninguno prometedor, devuelve [] y se salta
+        el análisis profundo (ahorra ~$0.40).
+        """
+        if not markets:
+            return []
+
+        top_n = CONFIG["PRE_FILTER_TOP_N"]
+
+        # Si hay pocos mercados, no vale la pena el llamado extra
+        if len(markets) <= top_n:
+            log.info(f"Pre-filtro fase 2: solo {len(markets)} mercados, saltando llamado batch")
+            return markets
+
+        # Construir resumen de cada mercado
+        summaries = []
+        for i, m in enumerate(markets):
+            prices = ", ".join(f"{o['name']}={o['price']:.3f}" for o in m.outcomes)
+            summaries.append(
+                f"{i+1}. \"{m.question}\" | Cat: {m.category} | "
+                f"Vol: ${m.volume:,.0f} | Liq: ${m.liquidity:,.0f} | "
+                f"{prices} | Resuelve: {m.end_date[:10]}"
+            )
+
+        prompt = f"""Eres un trader experto en mercados de predicción buscando EDGE REAL — mercados donde el precio NO refleja la probabilidad verdadera.
+
+MERCADOS DISPONIBLES:
+{chr(10).join(summaries)}
+
+CRITERIOS PARA SELECCIONAR (busca estos patrones):
+1. INFORMACIÓN ASIMÉTRICA — ¿Sabes algo que el precio no refleja? (decisiones ya anunciadas, datos públicos ignorados, tendencias claras)
+2. SESGO DE MERCADO — ¿El precio refleja opinión popular en vez de probabilidad real? (mercados emocionales, hype, miedo)
+3. RESOLUCIÓN CLARA — ¿Puedes estimar la probabilidad real con confianza >70%?
+4. PRECIO IRRACIONAL — ¿El precio está claramente fuera de rango lógico?
+
+CRITERIOS PARA DESCARTAR:
+- Deportes donde casas de apuestas ya tienen el precio correcto
+- Mercados de "¿llegará X precio?" en crypto/commodities (traders pro dominan)
+- Mercados donde genuinamente no tienes información para estimar mejor que el mercado
+- Si no estás seguro, NO lo incluyas
+
+Sé muy selectivo. Es mejor devolver 0-2 mercados realmente buenos que 5 mediocres.
+
+RESPONDE SOLO EN JSON:
+{{"promising": [1, 5], "reasoning": "breve explicación de por qué cada uno"}}
+
+Si NINGUNO tiene edge real: {{"promising": [], "reasoning": "ninguno presenta oportunidad clara"}}"""
+
+        try:
+            response = self.client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=400,
+                messages=[{"role": "user", "content": prompt}]
+                # SIN tools= → sin web search → muy barato (~$0.01)
+            )
+            text = "".join(b.text for b in response.content if b.type == "text").strip()
+            result = self._parse_json(text)
+
+            if not result or "promising" not in result:
+                log.warning("Pre-filtro fase 2: respuesta no parseable, usando top por score")
+                return markets[:top_n]
+
+            indices = [int(x) - 1 for x in result["promising"]
+                       if str(x).isdigit() and 0 < int(x) <= len(markets)]
+            reasoning = result.get("reasoning", "")
+
+            # Respetar decisión de Claude: si devuelve [], saltamos Phase 3 completamente
+            if not indices:
+                log.info(f"Pre-filtro fase 2: Claude no encontró edge real — saltando análisis profundo")
+                if reasoning:
+                    log.info(f"   Razón: {reasoning[:200]}")
+                return []
+
+            chosen = [markets[i] for i in indices]
+            log.info(f"Pre-filtro fase 2: {len(markets)} → {len(chosen)} mercados prometedores (~$0.01)")
+            if reasoning:
+                log.info(f"   Razón: {reasoning[:200]}")
+            return chosen
+
+        except Exception as e:
+            log.error(f"Error en pre_filter_markets: {e}")
+            return markets[:top_n]
+
  
  
 # ═══════════════════════════════════════════════════════════
@@ -609,19 +920,31 @@ class OrderExecutor:
         self.clob = None
         if not CONFIG["DRY_RUN"] and CLOB_AVAILABLE and CONFIG["PRIVATE_KEY"]:
             try:
-                kwargs = dict(
-                    host=CLOB_API, chain_id=POLYGON,
+                proxy = CONFIG["PROXY_ADDRESS"] or None
+                log.info(f"CLOB init: funder={'proxy wallet ' + proxy[:10] + '...' if proxy else 'None (EOA directo)'}")
+
+                # Inicializar cliente con clave y proxy (proxy wallet mode)
+                # signature_type=2 (POLY_GNOSIS_SAFE) para proxies Polymarket MetaMask
+                # signature_type=None→0 (EOA) para modo directo sin proxy
+                self.clob = ClobClient(
+                    host=CLOB_API,
+                    chain_id=POLYGON,
                     key=CONFIG["PRIVATE_KEY"],
-                    creds={
-                        "api_key": CONFIG["API_KEY"],
-                        "api_secret": CONFIG["API_SECRET"],
-                        "api_passphrase": CONFIG["API_PASSPHRASE"],
-                    }
+                    funder=proxy,
+                    signature_type=2 if proxy else None,
                 )
-                if CONFIG["PROXY_ADDRESS"]:
-                    kwargs["funder"] = CONFIG["PROXY_ADDRESS"]
-                    log.info(f"🔑 Proxy Wallet detectada: {CONFIG['PROXY_ADDRESS'][:10]}...")
-                self.clob = ClobClient(**kwargs)
+
+                # Configurar credenciales de API
+                if CONFIG["API_KEY"]:
+                    self.clob.set_api_creds(ApiCreds(
+                        api_key=CONFIG["API_KEY"],
+                        api_secret=CONFIG["API_SECRET"],
+                        api_passphrase=CONFIG["API_PASSPHRASE"],
+                    ))
+                else:
+                    # create_or_derive_api_creds maneja correctamente proxy wallets
+                    self.clob.set_api_creds(self.clob.create_or_derive_api_creds())
+
                 log.info("✅ CLOB conectado — modo REAL")
             except Exception as e:
                 log.error(f"Error CLOB: {e}")
@@ -631,20 +954,27 @@ class OrderExecutor:
     def buy(self, opp: Opportunity) -> Optional[Position]:
         """Ejecuta orden de compra y devuelve la posición creada."""
         import uuid
-        shares = opp.bet_size_usd / opp.market_price
- 
-        if CONFIG["DRY_RUN"] or self.clob is None:
+        # Exchange mínimo $5 USDC — ajustar si Kelly da menos
+        bet_size = max(opp.bet_size_usd, 5.0)
+        shares = bet_size / opp.market_price
+
+        if CONFIG["DRY_RUN"]:
             log.info(
                 f"[DRY RUN] 🟢 BUY '{opp.outcome_name}' @ {opp.market_price:.3f} "
-                f"| ${opp.bet_size_usd} → {shares:.2f} shares "
+                f"| ${bet_size} → {shares:.2f} shares "
                 f"| Edge: +{opp.edge*100:.1f}% | Conf: {opp.confidence}"
             )
+        elif self.clob is None:
+            log.error("BUY abortado: CLOB no inicializado (revisa PRIVATE_KEY y conexión)")
+            return None
         else:
+            if bet_size > opp.bet_size_usd:
+                log.info(f"Apuesta ${opp.bet_size_usd:.2f} ajustada al mínimo del exchange $5")
             try:
                 order = OrderArgs(
                     token_id=opp.token_id,
                     price=round(opp.market_price + 0.001, 3),
-                    size=opp.bet_size_usd,
+                    size=bet_size,
                     side="BUY",
                 )
                 self.clob.create_and_post_order(order)
@@ -658,7 +988,7 @@ class OrderExecutor:
             market_question=opp.market.question,
             outcome=opp.outcome_name,
             token_id=opp.token_id,
-            size_usd=opp.bet_size_usd,
+            size_usd=bet_size,
             shares=shares,
             entry_price=opp.market_price,
             ai_probability=opp.ai_probability,
@@ -675,13 +1005,16 @@ class OrderExecutor:
         pnl_usd  = received - position.size_usd
         pnl_pct  = pnl_usd / position.size_usd * 100
  
-        if CONFIG["DRY_RUN"] or self.clob is None:
+        if CONFIG["DRY_RUN"]:
             log.info(
                 f"[DRY RUN] {'🟢' if pnl_usd >= 0 else '🔴'} SELL '{position.outcome}' "
                 f"@ {current_price:.3f} | Recibido: ${received:.2f} | "
                 f"PnL: {'+'if pnl_usd>=0 else ''}{pnl_usd:.2f} ({pnl_pct:+.1f}%)"
             )
             return received
+        elif self.clob is None:
+            log.error("SELL abortado: CLOB no inicializado")
+            return position.size_usd  # devolver lo invertido como fallback seguro
  
         try:
             order = OrderArgs(
@@ -837,11 +1170,126 @@ class PolymarketAgent:
         if slots <= 0:
             log.info("Posiciones al máximo. Solo monitoreando.")
             return
- 
-        markets = self.scanner.get_active_markets()
-        markets = self.scanner.filter_markets(markets)
-        markets.sort(key=lambda m: m.volume, reverse=True)
-        markets = markets[:CONFIG["MAX_MARKETS_PER_RUN"]]
+
+        # ── ESTRATEGIA A: Resolución tardía (GRATIS — sin Claude) ────────────
+        # No usa analyzed_today: mercados pueden permanecer sin resolver varios días,
+        # y necesitamos poder reentrar si la posición anterior ya se cerró.
+        late_markets = self.scanner.find_late_resolution()
+        for m in late_markets[:3]:
+            if slots <= 0:
+                break
+            # Solo bloquear si ya tenemos posición ABIERTA en este mercado
+            if any(p.market_condition_id == m.condition_id for p in self.state.open_positions):
+                continue
+            best = max(m.outcomes, key=lambda o: o["price"])
+            if best["price"] < 0.90:
+                continue
+            bet_size = max(CONFIG["MIN_BET_USD"], min(3.0, self.state.bankroll * 0.05))
+            if self.state.bankroll < bet_size + 5:
+                continue
+            expected_profit_pct = ((1.0 / best["price"]) - 1) * 100
+            log.info(
+                f"LATE RESOLUTION: '{m.question[:60]}' | "
+                f"{best['name']} @ {best['price']:.3f} | "
+                f"Ganancia esperada: +{expected_profit_pct:.1f}% | Apuesta: ${bet_size:.2f}"
+            )
+            opp = Opportunity(
+                market=m,
+                outcome_name=best["name"],
+                token_id=best["token_id"],
+                market_price=best["price"],
+                ai_probability=0.95,
+                edge=round(1.0 - best["price"], 4),
+                kelly_fraction=0.05,
+                bet_size_usd=bet_size,
+                reasoning=f"Late resolution: mercado ya venció, {best['name']} a {best['price']:.3f}",
+                confidence="HIGH",
+            )
+            position = self.executor.buy(opp)
+            if position:
+                self.state.bankroll -= bet_size
+                self.state.open_positions.append(position)
+                slots -= 1
+                log.info("  Posición de resolución tardía abierta")
+
+        # ── ESTRATEGIA B: Arbitraje correlacionado (GRATIS — sin Claude) ─────
+        all_markets_raw = self.scanner.get_active_markets()
+        all_markets_filtered = self.scanner.filter_markets(all_markets_raw)
+        arb_opps = self.scanner.find_correlated_arbitrage(all_markets_filtered)
+        for arb in arb_opps[:2]:
+            if slots <= 0:
+                break
+            buy_m = arb["buy_market"]
+            buy_o = arb["buy_outcome"]
+            if buy_m.condition_id in self.state.analyzed_today:
+                continue
+            if any(p.market_condition_id == buy_m.condition_id for p in self.state.open_positions):
+                continue
+            bet_size = max(CONFIG["MIN_BET_USD"], min(3.0, self.state.bankroll * 0.05))
+            if self.state.bankroll < bet_size + 5:
+                continue
+            log.info(f"ARBITRAJE: {arb['reasoning']}")
+            opp = Opportunity(
+                market=buy_m,
+                outcome_name=buy_o["name"],
+                token_id=buy_o["token_id"],
+                market_price=buy_o["price"],
+                ai_probability=min(0.99, buy_o["price"] + arb["spread"]),
+                edge=arb["spread"],
+                kelly_fraction=0.05,
+                bet_size_usd=bet_size,
+                reasoning=arb["reasoning"],
+                confidence="HIGH",
+            )
+            position = self.executor.buy(opp)
+            if position:
+                self.state.bankroll -= bet_size
+                self.state.open_positions.append(position)
+                slots -= 1
+                log.info("  Posición de arbitraje abierta")
+            self.state.analyzed_today.add(buy_m.condition_id)
+
+        # ── ESTRATEGIA C: Edge con IA ─────────────────────────────────────────
+        markets = all_markets_raw  # reusar los ya descargados
+        markets = self.scanner.filter_markets(markets)            # Fase 1: filtros de código (gratis)
+        markets = self.scanner.deduplicate_markets(markets)       # Eliminar variaciones del mismo evento
+
+        # Scoring inteligente: priorizar volumen MEDIO y categorías nicho
+        def edge_score(m: Market) -> float:
+            vol = m.volume
+            if vol > 500_000:   vol_score = 0.2   # demasiado popular, bien preciado
+            elif vol > 100_000: vol_score = 0.5
+            elif vol > 25_000:  vol_score = 1.0   # sweet spot
+            elif vol > 5_000:   vol_score = 0.8
+            else:               vol_score = 0.3
+
+            category_bonus = {
+                "Politics": 1.3, "Science": 1.4, "Technology": 1.3,
+                "Economics": 1.2, "Crypto": 0.6, "Sports": 0.5, "Pop Culture": 0.9,
+            }
+            cat_score = category_bonus.get(m.category, 1.0)
+
+            best_dist = min(abs(o["price"] - 0.5) for o in m.outcomes) if m.outcomes else 0.5
+            uncertainty_score = 1.0 + (0.5 - best_dist)  # más cercano a 0.50 = más potencial
+
+            return vol_score * cat_score * uncertainty_score
+
+        markets.sort(key=edge_score, reverse=True)
+        log.info(f"Top categorías: {[m.category for m in markets[:5]]}")  # para calibrar bonuses
+        markets = markets[:20]                                    # cap: 20 al pre-filtro
+
+        # Excluir mercados ya analizados HOY antes de pasar a Claude
+        # Así el pre-filtro no selecciona mercados que ya descartamos (~$0.01 ahorrado por ciclo)
+        fresh_markets = [m for m in markets if m.condition_id not in self.state.analyzed_today]
+        if not fresh_markets:
+            log.info("Todos los mercados prometedores ya fueron analizados hoy — saltando Phase 2/3")
+            markets = []
+        else:
+            if len(fresh_markets) < len(markets):
+                log.info(f"Pre-filtro: excluyendo {len(markets)-len(fresh_markets)} ya analizados hoy")
+            markets = self.analyzer.pre_filter_markets(fresh_markets)  # Fase 2: Claude sin web search (~$0.01)
+
+        markets = markets[:CONFIG["MAX_MARKETS_PER_RUN"]]         # Fase 3: análisis profundo con web search
  
         opps = []
         for i, m in enumerate(markets):
