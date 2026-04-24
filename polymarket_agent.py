@@ -33,13 +33,13 @@ import anthropic
 import requests
  
 try:
-    from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, ApiCreds
-    from py_clob_client.constants import POLYGON
+    from py_clob_client_v2.client import ClobClient
+    from py_clob_client_v2.clob_types import OrderArgs, ApiCreds
+    from py_clob_client_v2.constants import POLYGON
     CLOB_AVAILABLE = True
 except ImportError:
     CLOB_AVAILABLE = False
-    logging.warning("py-clob-client no instalado. Corriendo en modo DRY RUN.")
+    logging.warning("py-clob-client-v2 no instalado. Corriendo en modo DRY RUN.")
  
 load_dotenv()
  
@@ -928,9 +928,9 @@ class OrderExecutor:
                 # signature_type=None→0 (EOA) para modo directo sin proxy
                 self.clob = ClobClient(
                     host=CLOB_API,
-                    chain_id=POLYGON,
+                    chain=POLYGON,
                     key=CONFIG["PRIVATE_KEY"],
-                    funder=proxy,
+                    funder_address=proxy,
                     signature_type=2 if proxy else None,
                 )
 
