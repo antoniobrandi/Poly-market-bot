@@ -1150,9 +1150,8 @@ class SmartMoneyMonitor:
     def fetch_recent_trades(self, wallet_address: str, limit: int = 10) -> list[dict]:
         try:
             resp = requests.get(
-                f"{POLYMARKET_DATA_API}/activities",
-                params={"user": wallet_address, "type": "TRADE",
-                        "limit": limit, "sort": "-timestamp"},
+                f"{POLYMARKET_DATA_API}/trades",
+                params={"user": wallet_address, "limit": limit},
                 timeout=10,
                 headers={
                     "Accept": "application/json",
