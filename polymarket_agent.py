@@ -87,8 +87,33 @@ CONFIG = {
     "DRY_RUN":              os.getenv("DRY_RUN", "true").lower() == "true",
     "STATE_FILE":           "agent_state.json",
     "LOG_FILE":             "polymarket_agent.log",
+
+    # ── Smart Money Following ──────────────────────────────────────────
+    "SMART_MONEY_ENABLED":      os.getenv("SMART_MONEY_ENABLED", "true").lower() == "true",
+    "SMART_MONEY_MAX_HOURS":    int(os.getenv("SMART_MONEY_MAX_HOURS", "2")),
+    "SMART_MONEY_MAX_COPIES":   int(os.getenv("SMART_MONEY_MAX_COPIES", "2")),
+    "SMART_MONEY_BET_PCT":      float(os.getenv("SMART_MONEY_BET_PCT", "0.03")),
+    "SMART_MONEY_MAX_SLIPPAGE": float(os.getenv("SMART_MONEY_MAX_SLIPPAGE", "0.03")),
 }
  
+# ═══════════════════════════════════════════════════════════
+#  SMART MONEY WALLETS
+# ═══════════════════════════════════════════════════════════
+SMART_WALLETS = [
+    {
+        "address":    "0x30d1c420d1abde9442d6762dd6f6d5f92df04525",
+        "name":       "randomWalkingS",
+        "categories": "Geopolítica/China/Trump",
+    },
+    {
+        "address":    "0xffb0b9b292e406fd250854a35a0c9bd5612aFa37",
+        "name":       "BloodyMummer",
+        "categories": "Geopolítica/Iran/Israel",
+    },
+]
+
+POLYMARKET_DATA_API = "https://data-api.polymarket.com"
+
 # ═══════════════════════════════════════════════════════════
 #  LOGGING
 # ═══════════════════════════════════════════════════════════
@@ -1113,6 +1138,190 @@ class StatePersistence:
  
  
 # ═══════════════════════════════════════════════════════════
+#  SMART MONEY MONITOR — copytrading de wallets verificadas
+# ═══════════════════════════════════════════════════════════
+class SmartMoneyMonitor:
+
+    def __init__(self, scanner: "PolymarketScanner", executor: "OrderExecutor", state: "AgentState"):
+        self.scanner  = scanner
+        self.executor = executor
+        self.state    = state
+
+    def fetch_recent_trades(self, wallet_address: str, limit: int = 10) -> list[dict]:
+        try:
+            resp = requests.get(
+                f"{POLYMARKET_DATA_API}/activities",
+                params={"user": wallet_address, "type": "TRADE",
+                        "limit": limit, "sort": "-timestamp"},
+                timeout=10,
+                headers={
+                    "Accept": "application/json",
+                    "Origin": "https://polymarket.com",
+                    "Referer": "https://polymarket.com/",
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, dict):
+                return data.get("data", [])
+            return data if isinstance(data, list) else []
+        except Exception as e:
+            log.error(f"[SmartMoney] Error fetching {wallet_address[:10]}: {e}")
+            return []
+
+    def is_trade_fresh(self, trade: dict) -> bool:
+        from datetime import timezone, timedelta
+        ts = trade.get("timestamp")
+        if not ts:
+            return False
+        try:
+            if isinstance(ts, (int, float)):
+                trade_time = datetime.fromtimestamp(ts, tz=timezone.utc)
+            else:
+                trade_time = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            return datetime.now(timezone.utc) - trade_time < timedelta(hours=CONFIG["SMART_MONEY_MAX_HOURS"])
+        except Exception:
+            return False
+
+    def get_token_id(self, trade: dict) -> Optional[str]:
+        for key in ("asset", "tokenId", "token_id", "asset_id"):
+            if trade.get(key):
+                return str(trade[key])
+        return None
+
+    def get_condition_id(self, trade: dict) -> Optional[str]:
+        for key in ("conditionId", "condition_id", "market"):
+            if trade.get(key):
+                return str(trade[key])
+        return None
+
+    def should_copy(self, trade: dict, wallet_name: str) -> bool:
+        if str(trade.get("side", "")).upper() != "BUY":
+            return False
+        if not self.is_trade_fresh(trade):
+            return False
+        try:
+            price = float(trade.get("price", 0))
+        except (ValueError, TypeError):
+            return False
+        if not (0.15 <= price <= 0.85):
+            log.info(f"[SmartMoney] {wallet_name}: precio fuera de zona ({price:.2f})")
+            return False
+        condition_id = self.get_condition_id(trade)
+        if not condition_id:
+            return False
+        if condition_id in self.state.analyzed_today:
+            return False
+        if any(p.market_condition_id == condition_id for p in self.state.open_positions):
+            return False
+        return True
+
+    def copy_trade(self, trade: dict, wallet_name: str) -> Optional[Position]:
+        token_id     = self.get_token_id(trade)
+        condition_id = self.get_condition_id(trade)
+        if not token_id or not condition_id:
+            return None
+
+        original_price = float(trade.get("price", 0))
+        current_price  = self.scanner.get_token_price(token_id)
+        if current_price is None:
+            return None
+
+        slippage = (current_price - original_price) / max(original_price, 1e-9)
+        if slippage > CONFIG["SMART_MONEY_MAX_SLIPPAGE"]:
+            log.info(
+                f"[SmartMoney] {wallet_name}: slippage {slippage*100:.1f}% > "
+                f"{CONFIG['SMART_MONEY_MAX_SLIPPAGE']*100:.0f}%"
+            )
+            return None
+        if not (0.15 <= current_price <= 0.85):
+            return None
+
+        bet_size = round(
+            max(CONFIG["MIN_BET_USD"],
+                min(CONFIG["MAX_BET_USD"],
+                    self.state.bankroll * CONFIG["SMART_MONEY_BET_PCT"])),
+            2
+        )
+        if self.state.bankroll < bet_size + 5:
+            log.warning("[SmartMoney] Bankroll insuficiente")
+            return None
+
+        market = Market(
+            condition_id=condition_id,
+            question=str(trade.get("title", trade.get("question", "Smart Money Copy"))),
+            category="SMART_MONEY",
+            volume=0,
+            liquidity=0,
+            end_date=str(trade.get("endDate", "")),
+            outcomes=[{"name": str(trade.get("outcome", "Yes")),
+                       "token_id": token_id, "price": current_price}],
+            url="",
+        )
+        opp = Opportunity(
+            market=market,
+            outcome_name=market.outcomes[0]["name"],
+            token_id=token_id,
+            market_price=current_price,
+            ai_probability=min(0.99, current_price + 0.10),
+            edge=0.10,
+            kelly_fraction=CONFIG["SMART_MONEY_BET_PCT"],
+            bet_size_usd=bet_size,
+            reasoning=f"Smart Money copy de {wallet_name}",
+            confidence="MEDIUM",
+        )
+        log.info(
+            f"[SmartMoney] 🐋 COPIANDO {wallet_name}: '{market.question[:50]}' | "
+            f"{opp.outcome_name} @ {current_price:.3f} | ${bet_size:.2f}"
+        )
+        return self.executor.buy(opp)
+
+    def run(self) -> int:
+        if not CONFIG["SMART_MONEY_ENABLED"]:
+            return 0
+
+        slots = CONFIG["MAX_OPEN_BETS"] - len(self.state.open_positions)
+        if slots <= 0:
+            log.info("[SmartMoney] Posiciones al máximo, saltando")
+            return 0
+
+        copies_made = 0
+        max_copies  = min(CONFIG["SMART_MONEY_MAX_COPIES"], slots)
+        log.info(f"[SmartMoney] Monitoreando {len(SMART_WALLETS)} wallets...")
+
+        for wallet_info in SMART_WALLETS:
+            if copies_made >= max_copies:
+                break
+            address = wallet_info["address"]
+            name    = wallet_info["name"]
+            trades  = self.fetch_recent_trades(address)
+
+            if not trades:
+                log.info(f"[SmartMoney] {name}: sin trades recientes")
+                continue
+            log.info(f"[SmartMoney] {name}: {len(trades)} trades encontrados")
+
+            for trade in trades:
+                if copies_made >= max_copies:
+                    break
+                if not self.should_copy(trade, name):
+                    continue
+                condition_id = self.get_condition_id(trade)
+                position = self.copy_trade(trade, name)
+                if position:
+                    self.state.bankroll -= position.size_usd
+                    self.state.open_positions.append(position)
+                    if condition_id:
+                        self.state.analyzed_today.add(condition_id)
+                    log.info("[SmartMoney] ✅ Posición de copia abierta")
+                    copies_made += 1
+
+        log.info(f"[SmartMoney] Ciclo terminado: {copies_made} copias")
+        return copies_made
+
+
+# ═══════════════════════════════════════════════════════════
 #  AGENTE PRINCIPAL
 # ═══════════════════════════════════════════════════════════
 class PolymarketAgent:
@@ -1135,7 +1344,8 @@ class PolymarketAgent:
                 initial_bankroll=CONFIG["BANKROLL"],
             )
             log.info(f"🆕 Nuevo agente iniciado con ${CONFIG['BANKROLL']} USDC")
- 
+
+        self.smart_money = SmartMoneyMonitor(self.scanner, self.executor, self.state)
         self._print_banner()
  
     def run(self):
@@ -1248,6 +1458,14 @@ class PolymarketAgent:
                 slots -= 1
                 log.info("  Posición de arbitraje abierta")
             self.state.analyzed_today.add(buy_m.condition_id)
+
+        # ── ESTRATEGIA D: Smart Money Following (GRATIS — sin Claude) ─────────
+        try:
+            sm_copies = self.smart_money.run()
+            if sm_copies > 0:
+                slots = CONFIG["MAX_OPEN_BETS"] - len(self.state.open_positions)
+        except Exception as e:
+            log.error(f"Error en Smart Money: {e}")
 
         # ── ESTRATEGIA C: Edge con IA ─────────────────────────────────────────
         markets = all_markets_raw  # reusar los ya descargados
