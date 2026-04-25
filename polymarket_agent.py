@@ -90,7 +90,7 @@ CONFIG = {
 
     # ── Smart Money Following ──────────────────────────────────────────
     "SMART_MONEY_ENABLED":      os.getenv("SMART_MONEY_ENABLED", "true").lower() == "true",
-    "SMART_MONEY_MAX_HOURS":    int(os.getenv("SMART_MONEY_MAX_HOURS", "2")),
+    "SMART_MONEY_MAX_HOURS":    int(os.getenv("SMART_MONEY_MAX_HOURS", "24")),
     "SMART_MONEY_MAX_COPIES":   int(os.getenv("SMART_MONEY_MAX_COPIES", "2")),
     "SMART_MONEY_BET_PCT":      float(os.getenv("SMART_MONEY_BET_PCT", "0.03")),
     "SMART_MONEY_MAX_SLIPPAGE": float(os.getenv("SMART_MONEY_MAX_SLIPPAGE", "0.03")),
@@ -966,13 +966,42 @@ class OrderExecutor:
                         api_secret=CONFIG["API_SECRET"],
                         api_passphrase=CONFIG["API_PASSPHRASE"],
                     ))
+                    log.info("✅ CLOB conectado con credenciales del .env")
                 else:
-                    # create_or_derive_api_creds maneja correctamente proxy wallets
-                    self.clob.set_api_creds(self.clob.create_or_derive_api_creds())
+                    creds = None
+                    try:
+                        creds = self.clob.create_or_derive_api_creds()
+                        log.info("✅ Credenciales derivadas automáticamente")
+                    except Exception as e1:
+                        log.warning(f"create_or_derive_api_creds falló: {e1}")
+                        try:
+                            creds = self.clob.create_api_key()
+                            log.info("✅ Credenciales creadas con create_api_key")
+                        except Exception as e2:
+                            log.warning(f"create_api_key falló: {e2}")
 
-                log.info("✅ CLOB conectado — modo REAL")
+                    if creds:
+                        self.clob.set_api_creds(creds)
+                        log.info(
+                            f"💡 Agrega estas credenciales al .env para no regenerarlas:\n"
+                            f"   POLYMARKET_API_KEY={getattr(creds, 'api_key', '?')}\n"
+                            f"   POLYMARKET_API_SECRET={getattr(creds, 'api_secret', '?')}\n"
+                            f"   POLYMARKET_API_PASSPHRASE={getattr(creds, 'api_passphrase', '?')}"
+                        )
+                    else:
+                        log.error(
+                            "❌ No se pudieron obtener credenciales de API.\n"
+                            "   Agrega manualmente al .env:\n"
+                            "     POLYMARKET_API_KEY=...\n"
+                            "     POLYMARKET_API_SECRET=...\n"
+                            "     POLYMARKET_API_PASSPHRASE=...\n"
+                            "   Obtén las credenciales en: polymarket.com → Settings → API"
+                        )
+                        self.clob = None
+
             except Exception as e:
                 log.error(f"Error CLOB: {e}")
+                self.clob = None
         elif CONFIG["DRY_RUN"]:
             log.info("🧪 Modo DRY RUN — órdenes simuladas")
  
@@ -1363,7 +1392,14 @@ class PolymarketAgent:
     def _run_cycle(self):
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log.info(f"═══ CICLO {now} | Bankroll: ${self.state.bankroll:.2f} ═══")
- 
+
+        if not CONFIG["DRY_RUN"] and self.executor.clob is None:
+            log.error(
+                "⛔ CLOB no inicializado — revisa credenciales en .env. "
+                "Ciclo cancelado para no gastar créditos de Claude."
+            )
+            return
+
         # ── FASE 1: Resetear stop diario si es nuevo día ─────────────────────
         self._check_daily_reset()
  
