@@ -90,10 +90,22 @@ CONFIG = {
 
     # ── Smart Money Following ──────────────────────────────────────────
     "SMART_MONEY_ENABLED":      os.getenv("SMART_MONEY_ENABLED", "true").lower() == "true",
-    "SMART_MONEY_MAX_HOURS":    int(os.getenv("SMART_MONEY_MAX_HOURS", "24")),
+    "SMART_MONEY_MAX_HOURS":    int(os.getenv("SMART_MONEY_MAX_HOURS", "72")),
     "SMART_MONEY_MAX_COPIES":   int(os.getenv("SMART_MONEY_MAX_COPIES", "2")),
     "SMART_MONEY_BET_PCT":      float(os.getenv("SMART_MONEY_BET_PCT", "0.03")),
     "SMART_MONEY_MAX_SLIPPAGE": float(os.getenv("SMART_MONEY_MAX_SLIPPAGE", "0.03")),
+
+    # ── Contrarian Fade ─────────────────────────────────
+    "CONTRARIAN_ENABLED":      os.getenv("CONTRARIAN_ENABLED", "true").lower() == "true",
+    "CONTRARIAN_MIN_MOVE":     float(os.getenv("CONTRARIAN_MIN_MOVE", "0.10")),
+    "CONTRARIAN_MAX_MOVE":     float(os.getenv("CONTRARIAN_MAX_MOVE", "0.40")),
+    "CONTRARIAN_BET_USD":      float(os.getenv("CONTRARIAN_BET_USD", "2.0")),
+    "CONTRARIAN_MAX_POSITIONS": int(os.getenv("CONTRARIAN_MAX_POSITIONS", "2")),
+    "CONTRARIAN_LOOKBACK_HOURS": int(os.getenv("CONTRARIAN_LOOKBACK_HOURS", "24")),
+    "CONTRARIAN_PRICE_MIN":    float(os.getenv("CONTRARIAN_PRICE_MIN", "0.30")),
+    "CONTRARIAN_PRICE_MAX":    float(os.getenv("CONTRARIAN_PRICE_MAX", "0.70")),
+    "CONTRARIAN_MIN_DAYS_LEFT": int(os.getenv("CONTRARIAN_MIN_DAYS_LEFT", "2")),
+    "CONTRARIAN_MAX_MARKETS_TO_SCAN": int(os.getenv("CONTRARIAN_MAX_MARKETS_TO_SCAN", "30")),
 }
  
 # ═══════════════════════════════════════════════════════════
@@ -109,6 +121,16 @@ SMART_WALLETS = [
         "address":    "0xffb0b9b292e406fd250854a35a0c9bd5612aFa37",
         "name":       "BloodyMummer",
         "categories": "Geopolítica/Iran/Israel",
+    },
+    {
+        "address":    "0x07921379f7b31ef93da634b688b2fe36897db778",
+        "name":       "ewelmealt",
+        "categories": "Fútbol/La Liga",
+    },
+    {
+        "address":    "0x92672c80d36dcd08172aa1e51dface0f20b70f9a",
+        "name":       "CKW",
+        "categories": "UFC/MLB",
     },
 ]
 
@@ -215,6 +237,7 @@ class AgentState:
 # ═══════════════════════════════════════════════════════════
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API  = "https://clob.polymarket.com"
+CLOB_PRICES_HISTORY = "https://clob.polymarket.com/prices-history"
  
 class PolymarketScanner:
  
@@ -953,9 +976,9 @@ class OrderExecutor:
                 # signature_type=None→0 (EOA) para modo directo sin proxy
                 self.clob = ClobClient(
                     host=CLOB_API,
-                    chain=POLYGON,
+                    chain_id=POLYGON,
                     key=CONFIG["PRIVATE_KEY"],
-                    funder_address=proxy,
+                    funder=proxy,
                     signature_type=2 if proxy else None,
                 )
 
@@ -970,15 +993,15 @@ class OrderExecutor:
                 else:
                     creds = None
                     try:
-                        creds = self.clob.create_or_derive_api_creds()
+                        creds = self.clob.create_or_derive_api_key()
                         log.info("✅ Credenciales derivadas automáticamente")
                     except Exception as e1:
-                        log.warning(f"create_or_derive_api_creds falló: {e1}")
+                        log.warning(f"create_or_derive_api_key falló: {e1}")
                         try:
-                            creds = self.clob.create_api_key()
-                            log.info("✅ Credenciales creadas con create_api_key")
+                            creds = self.clob.derive_api_key()
+                            log.info("✅ Credenciales derivadas con derive_api_key")
                         except Exception as e2:
-                            log.warning(f"create_api_key falló: {e2}")
+                            log.warning(f"derive_api_key falló: {e2}")
 
                     if creds:
                         self.clob.set_api_creds(creds)
@@ -1176,7 +1199,7 @@ class SmartMoneyMonitor:
         self.executor = executor
         self.state    = state
 
-    def fetch_recent_trades(self, wallet_address: str, limit: int = 10) -> list[dict]:
+    def fetch_recent_trades(self, wallet_address: str, limit: int = 20) -> list[dict]:
         try:
             resp = requests.get(
                 f"{POLYMARKET_DATA_API}/trades",
@@ -1225,23 +1248,31 @@ class SmartMoneyMonitor:
         return None
 
     def should_copy(self, trade: dict, wallet_name: str) -> bool:
-        if str(trade.get("side", "")).upper() != "BUY":
+        side = str(trade.get("side", "")).upper()
+        if side != "BUY":
+            log.info(f"[SmartMoney] {wallet_name}: descartado por side='{side}' (keys: {list(trade.keys())})")
             return False
+        ts = trade.get("timestamp")
         if not self.is_trade_fresh(trade):
+            log.info(f"[SmartMoney] {wallet_name}: trade no fresco (timestamp={ts!r})")
             return False
         try:
             price = float(trade.get("price", 0))
         except (ValueError, TypeError):
+            log.info(f"[SmartMoney] {wallet_name}: precio inválido ({trade.get('price')!r})")
             return False
         if not (0.15 <= price <= 0.85):
             log.info(f"[SmartMoney] {wallet_name}: precio fuera de zona ({price:.2f})")
             return False
         condition_id = self.get_condition_id(trade)
         if not condition_id:
+            log.info(f"[SmartMoney] {wallet_name}: sin condition_id (keys: {list(trade.keys())})")
             return False
         if condition_id in self.state.analyzed_today:
+            log.info(f"[SmartMoney] {wallet_name}: condition_id ya analizado hoy")
             return False
         if any(p.market_condition_id == condition_id for p in self.state.open_positions):
+            log.info(f"[SmartMoney] {wallet_name}: posición ya abierta en este mercado")
             return False
         return True
 
@@ -1254,16 +1285,18 @@ class SmartMoneyMonitor:
         original_price = float(trade.get("price", 0))
         current_price  = self.scanner.get_token_price(token_id)
         if current_price is None:
+            log.info(f"[SmartMoney] {wallet_name}: no se pudo obtener precio actual (token_id={token_id[:10]}...)")
             return None
 
         slippage = (current_price - original_price) / max(original_price, 1e-9)
         if slippage > CONFIG["SMART_MONEY_MAX_SLIPPAGE"]:
             log.info(
                 f"[SmartMoney] {wallet_name}: slippage {slippage*100:.1f}% > "
-                f"{CONFIG['SMART_MONEY_MAX_SLIPPAGE']*100:.0f}%"
+                f"{CONFIG['SMART_MONEY_MAX_SLIPPAGE']*100:.0f}% (compró a {original_price:.3f}, ahora {current_price:.3f})"
             )
             return None
         if not (0.15 <= current_price <= 0.85):
+            log.info(f"[SmartMoney] {wallet_name}: precio actual fuera de zona ({current_price:.3f})")
             return None
 
         bet_size = round(
@@ -1329,6 +1362,8 @@ class SmartMoneyMonitor:
                 log.info(f"[SmartMoney] {name}: sin trades recientes")
                 continue
             log.info(f"[SmartMoney] {name}: {len(trades)} trades encontrados")
+            log.info(f"[SmartMoney] {name} sample trade keys: {list(trades[0].keys())}")
+            log.info(f"[SmartMoney] {name} sample trade: side={trades[0].get('side')!r} price={trades[0].get('price')!r} timestamp={trades[0].get('timestamp')!r}")
 
             for trade in trades:
                 if copies_made >= max_copies:
@@ -1347,6 +1382,230 @@ class SmartMoneyMonitor:
 
         log.info(f"[SmartMoney] Ciclo terminado: {copies_made} copias")
         return copies_made
+
+
+# ═══════════════════════════════════════════════════════════
+#  CONTRARIAN FADE — apuesta contra movimientos exagerados
+# ═══════════════════════════════════════════════════════════
+class ContrarianFadeStrategy:
+    """
+    Detecta tokens con movimiento >10% en 24h y apuesta CONTRA.
+
+    Lógica:
+    - Si "Yes" subió >10% → comprar "No" (asumiendo sobrerreacción al alza)
+    - Si "Yes" bajó >10% → comprar "Yes" (asumiendo sobrerreacción a la baja)
+
+    Filtros:
+    - Precio actual entre 0.30-0.70 (zona de incertidumbre)
+    - Movimiento entre 10% y 40% (>40% probablemente es noticia real)
+    - Mínimo 2 días para resolución
+    - Apuesta fija de $2 (confianza BAJA, no escalar con Kelly)
+
+    NO usa Claude API. Es 100% gratis.
+    Reutiliza la lista de mercados ya descargada por _run_cycle.
+    """
+
+    def __init__(self, scanner: PolymarketScanner, executor: OrderExecutor, state: AgentState):
+        self.scanner = scanner
+        self.executor = executor
+        self.state = state
+
+    def get_price_change(self, token_id: str) -> Optional[float]:
+        """
+        Obtiene el cambio porcentual del precio en las últimas N horas
+        usando el endpoint clob.polymarket.com/prices-history.
+
+        Retorna: float (ej: 0.15 = +15%, -0.20 = -20%) o None si falla.
+        """
+        try:
+            end = int(time.time())
+            lookback_seconds = CONFIG["CONTRARIAN_LOOKBACK_HOURS"] * 3600
+            start = end - lookback_seconds
+
+            resp = requests.get(
+                CLOB_PRICES_HISTORY,
+                params={
+                    "market": token_id,
+                    "startTs": start,
+                    "endTs": end,
+                    "fidelity": 60,
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            history = data.get("history", [])
+
+            if len(history) < 2:
+                return None
+
+            old_price = float(history[0]["p"])
+            new_price = float(history[-1]["p"])
+
+            if old_price <= 0:
+                return None
+
+            return (new_price - old_price) / old_price
+
+        except Exception as e:
+            log.debug(f"[Contrarian] Error obteniendo precio histórico: {e}")
+            return None
+
+    def find_outcome_by_name(self, market: Market, name: str) -> Optional[dict]:
+        """Busca un outcome por nombre (case-insensitive)."""
+        for o in market.outcomes:
+            if o["name"].lower() == name.lower():
+                return o
+        return None
+
+    def evaluate_market(self, market: Market) -> Optional[dict]:
+        """
+        Evalúa si vale la pena hacer fade en este mercado.
+        Retorna dict con info del trade o None si no aplica.
+        """
+        # Filtro 1: días para resolución
+        try:
+            end_dt = datetime.fromisoformat(market.end_date.replace("Z", ""))
+            days_left = (end_dt - datetime.utcnow()).days
+            if days_left < CONFIG["CONTRARIAN_MIN_DAYS_LEFT"]:
+                return None
+        except Exception:
+            return None
+
+        # Filtro 2: necesita outcomes (Yes/No)
+        if len(market.outcomes) < 2:
+            return None
+
+        yes_outcome = self.find_outcome_by_name(market, "Yes")
+        no_outcome = self.find_outcome_by_name(market, "No")
+        if not yes_outcome or not no_outcome:
+            return None
+
+        current_yes_price = yes_outcome["price"]
+
+        # Filtro 3: precio en zona de incertidumbre
+        if not (CONFIG["CONTRARIAN_PRICE_MIN"] <= current_yes_price <= CONFIG["CONTRARIAN_PRICE_MAX"]):
+            return None
+
+        # Calcular cambio en 24h del Yes
+        change = self.get_price_change(yes_outcome["token_id"])
+        if change is None:
+            return None
+
+        abs_change = abs(change)
+
+        # Filtro 4: movimiento dentro del rango target
+        if abs_change < CONFIG["CONTRARIAN_MIN_MOVE"]:
+            return None
+        if abs_change > CONFIG["CONTRARIAN_MAX_MOVE"]:
+            return None
+
+        # Decidir dirección del fade
+        if change > 0:
+            target = no_outcome
+            direction_log = "Yes ↑ → comprar No"
+        else:
+            target = yes_outcome
+            direction_log = "Yes ↓ → comprar Yes"
+
+        return {
+            "outcome": target,
+            "yes_change": change,
+            "yes_price_now": current_yes_price,
+            "direction_log": direction_log,
+        }
+
+    def execute_fade(self, market: Market, fade_info: dict) -> bool:
+        """Ejecuta el fade construyendo Opportunity y usando OrderExecutor.buy."""
+        outcome = fade_info["outcome"]
+        bet_size = CONFIG["CONTRARIAN_BET_USD"]
+
+        # Verificar bankroll
+        if self.state.bankroll < bet_size + 5:
+            log.warning(f"[Contrarian] Bankroll insuficiente para fade")
+            return False
+
+        # Verificar slots
+        if len(self.state.open_positions) >= CONFIG["MAX_OPEN_BETS"]:
+            return False
+
+        # No duplicar mercado ya operado
+        if any(p.market_condition_id == market.condition_id for p in self.state.open_positions):
+            return False
+
+        if market.condition_id in self.state.analyzed_today:
+            return False
+
+        # Verificar precio mínimo válido
+        if outcome["price"] <= 0 or outcome["price"] >= 1:
+            return False
+
+        opp = Opportunity(
+            market=market,
+            outcome_name=outcome["name"],
+            token_id=outcome["token_id"],
+            market_price=outcome["price"],
+            ai_probability=outcome["price"] + 0.10,
+            edge=0.10,
+            kelly_fraction=bet_size / max(self.state.bankroll, 1),
+            bet_size_usd=bet_size,
+            reasoning=f"Contrarian fade: Yes cambió {fade_info['yes_change']*100:+.1f}% en 24h",
+            confidence="LOW",
+        )
+
+        log.info(
+            f"[Contrarian] FADE: '{market.question[:60]}' | "
+            f"{fade_info['direction_log']} @ {outcome['price']:.3f} | "
+            f"Cambio Yes 24h: {fade_info['yes_change']*100:+.1f}% | ${bet_size}"
+        )
+
+        position = self.executor.buy(opp)
+        if position:
+            self.state.bankroll -= bet_size
+            self.state.open_positions.append(position)
+            self.state.analyzed_today.add(market.condition_id)
+            log.info(f"[Contrarian] Posicion de fade abierta")
+            return True
+        return False
+
+    def run(self, markets: list[Market]) -> int:
+        """
+        Ejecuta un ciclo de búsqueda de fades.
+        Recibe la lista de mercados ya descargada por _run_cycle (no hace fetch propio).
+        Retorna número de fades ejecutados.
+        """
+        if not CONFIG["CONTRARIAN_ENABLED"]:
+            return 0
+
+        if not markets:
+            return 0
+
+        slots_disponibles = CONFIG["MAX_OPEN_BETS"] - len(self.state.open_positions)
+        if slots_disponibles <= 0:
+            log.info("[Contrarian] Posiciones al máximo, saltando")
+            return 0
+
+        max_fades = min(CONFIG["CONTRARIAN_MAX_POSITIONS"], slots_disponibles)
+        fades_ejecutados = 0
+        analizados = 0
+        max_scan = CONFIG["CONTRARIAN_MAX_MARKETS_TO_SCAN"]
+
+        log.info(f"[Contrarian] Buscando fades en hasta {max_scan} mercados...")
+
+        for market in markets[:max_scan]:
+            if fades_ejecutados >= max_fades:
+                break
+
+            analizados += 1
+            fade_info = self.evaluate_market(market)
+            if not fade_info:
+                continue
+
+            if self.execute_fade(market, fade_info):
+                fades_ejecutados += 1
+
+        log.info(f"[Contrarian] Ciclo terminado: {analizados} analizados, {fades_ejecutados} fades")
+        return fades_ejecutados
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1374,6 +1633,7 @@ class PolymarketAgent:
             log.info(f"🆕 Nuevo agente iniciado con ${CONFIG['BANKROLL']} USDC")
 
         self.smart_money = SmartMoneyMonitor(self.scanner, self.executor, self.state)
+        self.contrarian = ContrarianFadeStrategy(self.scanner, self.executor, self.state)
         self._print_banner()
  
     def run(self):
@@ -1506,6 +1766,12 @@ class PolymarketAgent:
         markets = all_markets_raw  # reusar los ya descargados
         markets = self.scanner.filter_markets(markets)            # Fase 1: filtros de código (gratis)
         markets = self.scanner.deduplicate_markets(markets)       # Eliminar variaciones del mismo evento
+
+        # ── ESTRATEGIA 5: Contrarian Fade (gratis, sin Claude) ──────────
+        try:
+            self.contrarian.run(markets)
+        except Exception as e:
+            log.error(f"Error en Contrarian Fade: {e}")
 
         # Scoring inteligente: priorizar volumen MEDIO y categorías nicho
         def edge_score(m: Market) -> float:
