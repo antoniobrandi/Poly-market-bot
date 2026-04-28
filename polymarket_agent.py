@@ -1274,6 +1274,18 @@ class SmartMoneyMonitor:
         if any(p.market_condition_id == condition_id for p in self.state.open_positions):
             log.info(f"[SmartMoney] {wallet_name}: posición ya abierta en este mercado")
             return False
+        end_date_raw = trade.get("endDate") or trade.get("end_date")
+        if end_date_raw:
+            try:
+                from datetime import timezone
+                end_dt = datetime.fromisoformat(str(end_date_raw).replace("Z", "+00:00"))
+                if end_dt.tzinfo is None:
+                    end_dt = end_dt.replace(tzinfo=timezone.utc)
+                if end_dt <= datetime.now(timezone.utc):
+                    log.info(f"[SmartMoney] {wallet_name}: mercado ya vencido (end_date={end_date_raw})")
+                    return False
+            except (ValueError, TypeError):
+                pass
         return True
 
     def copy_trade(self, trade: dict, wallet_name: str) -> Optional[Position]:
