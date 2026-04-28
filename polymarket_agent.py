@@ -93,7 +93,7 @@ CONFIG = {
     "SMART_MONEY_MAX_HOURS":    int(os.getenv("SMART_MONEY_MAX_HOURS", "72")),
     "SMART_MONEY_MAX_COPIES":   int(os.getenv("SMART_MONEY_MAX_COPIES", "2")),
     "SMART_MONEY_BET_PCT":      float(os.getenv("SMART_MONEY_BET_PCT", "0.03")),
-    "SMART_MONEY_MAX_SLIPPAGE": float(os.getenv("SMART_MONEY_MAX_SLIPPAGE", "0.03")),
+    "SMART_MONEY_MAX_SLIPPAGE": float(os.getenv("SMART_MONEY_MAX_SLIPPAGE", "0.10")),
 
     # ── Contrarian Fade ─────────────────────────────────
     "CONTRARIAN_ENABLED":      os.getenv("CONTRARIAN_ENABLED", "true").lower() == "true",
@@ -447,7 +447,21 @@ class PolymarketScanner:
         return unique
 
     def get_token_price(self, token_id: str) -> Optional[float]:
-        """Obtiene el precio actual de un token específico."""
+        """Obtiene el precio actual de un token usando el midpoint del order book."""
+        try:
+            resp = requests.get(
+                f"{CLOB_API}/midpoint",
+                params={"token_id": token_id},
+                timeout=10
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            price = float(data.get("mid", 0))
+            if 0 < price < 1:
+                return price
+        except Exception:
+            pass
+        # Fallback: last-trade-price si el midpoint falla
         try:
             resp = requests.get(
                 f"{CLOB_API}/last-trade-price",
@@ -1348,6 +1362,22 @@ class SmartMoneyMonitor:
             f"[SmartMoney] 🐋 COPIANDO {wallet_name}: '{market.question[:50]}' | "
             f"{opp.outcome_name} @ {current_price:.3f} | ${bet_size:.2f}"
         )
+        try:
+            chk = requests.get(
+                f"{CLOB_API}/book",
+                params={"token_id": token_id},
+                timeout=8,
+            )
+            body = chk.json()
+            if isinstance(body, dict) and "orderbook does not exist" in str(body.get("error", "")).lower():
+                log.info(
+                    f"[SmartMoney] {wallet_name}: orderbook no existe para "
+                    f"'{market.question[:40]}', blacklistando condition_id"
+                )
+                self.state.analyzed_today.add(condition_id)
+                return None
+        except Exception:
+            pass
         return self.executor.buy(opp)
 
     def run(self) -> int:
