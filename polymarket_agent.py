@@ -1952,16 +1952,20 @@ class PolymarketAgent:
 
         # Excluir mercados ya analizados HOY antes de pasar a Claude
         # Así el pre-filtro no selecciona mercados que ya descartamos (~$0.01 ahorrado por ciclo)
-        fresh_markets = [m for m in markets if m.condition_id not in self.state.analyzed_today]
-        if not fresh_markets:
-            log.info("Todos los mercados prometedores ya fueron analizados hoy — saltando Phase 2/3")
+        if CONFIG["MAX_MARKETS_PER_RUN"] == 0:
+            log.info("MAX_MARKETS_PER_RUN=0 — saltando análisis Claude (modo gratuito)")
             markets = []
         else:
-            if len(fresh_markets) < len(markets):
-                log.info(f"Pre-filtro: excluyendo {len(markets)-len(fresh_markets)} ya analizados hoy")
-            markets = self.analyzer.pre_filter_markets(fresh_markets)  # Fase 2: Claude sin web search (~$0.01)
+            fresh_markets = [m for m in markets if m.condition_id not in self.state.analyzed_today]
+            if not fresh_markets:
+                log.info("Todos los mercados prometedores ya fueron analizados hoy — saltando Phase 2/3")
+                markets = []
+            else:
+                if len(fresh_markets) < len(markets):
+                    log.info(f"Pre-filtro: excluyendo {len(markets)-len(fresh_markets)} ya analizados hoy")
+                markets = self.analyzer.pre_filter_markets(fresh_markets)  # Fase 2: Claude sin web search (~$0.01)
 
-        markets = markets[:CONFIG["MAX_MARKETS_PER_RUN"]]         # Fase 3: análisis profundo con web search
+            markets = markets[:CONFIG["MAX_MARKETS_PER_RUN"]]     # Fase 3: análisis profundo con web search
  
         opps = []
         for i, m in enumerate(markets):
