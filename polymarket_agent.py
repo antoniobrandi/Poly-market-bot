@@ -1041,7 +1041,72 @@ class OrderExecutor:
                 self.clob = None
         elif CONFIG["DRY_RUN"]:
             log.info("🧪 Modo DRY RUN — órdenes simuladas")
- 
+
+        # Cache de token_ids con exposición real en Polymarket (actualizado cada ciclo)
+        self._live_token_ids: set[str] = set()
+
+    def refresh_live_positions(self) -> None:
+        """
+        Consulta Polymarket (data API + CLOB open orders) para construir
+        el conjunto de token_ids donde ya tenemos exposición real.
+        Se llama una vez al inicio de cada ciclo.
+        """
+        token_ids: set[str] = set()
+
+        # 1. Posiciones reales (tokens en cartera) vía data API pública
+        address = CONFIG.get("PROXY_ADDRESS", "")
+        if address and not CONFIG["DRY_RUN"]:
+            try:
+                resp = requests.get(
+                    f"{POLYMARKET_DATA_API}/positions",
+                    params={"user": address, "limit": 500},
+                    timeout=8,
+                    headers={
+                        "Accept": "application/json",
+                        "Origin": "https://polymarket.com",
+                        "Referer": "https://polymarket.com/",
+                        "User-Agent": "Mozilla/5.0",
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                items = data if isinstance(data, list) else data.get("data", [])
+                for p in items:
+                    size = float(p.get("size", p.get("amount", 0)) or 0)
+                    if size > 0:
+                        tid = p.get("asset", p.get("asset_id", p.get("token_id", "")))
+                        if tid:
+                            token_ids.add(str(tid))
+                log.info(f"[CLOB] Posiciones reales en Polymarket: {len(token_ids)} tokens")
+            except Exception as e:
+                log.warning(f"[CLOB] No se pudo consultar posiciones: {e}")
+
+        # 2. Órdenes pendientes (limit orders en espera) vía CLOB SDK
+        if self.clob is not None and not CONFIG["DRY_RUN"]:
+            try:
+                orders = self.clob.get_orders()
+                for o in (orders or []):
+                    tid = (
+                        getattr(o, "asset_id", None)
+                        or getattr(o, "token_id", None)
+                        or (o.get("asset_id") if isinstance(o, dict) else None)
+                        or (o.get("token_id") if isinstance(o, dict) else None)
+                    )
+                    if tid:
+                        token_ids.add(str(tid))
+                log.info(f"[CLOB] Órdenes pendientes: {len(token_ids)} tokens (total con posiciones)")
+            except Exception as e:
+                log.warning(f"[CLOB] No se pudo consultar órdenes abiertas: {e}")
+
+        self._live_token_ids = token_ids
+
+    def has_market_exposure(self, token_ids: list[str]) -> bool:
+        """
+        Devuelve True si alguno de los token_ids dados ya tiene
+        exposición real en Polymarket (posición o orden pendiente).
+        """
+        return bool(self._live_token_ids & set(token_ids))
+
     def buy(self, opp: Opportunity) -> Optional[Position]:
         """Ejecuta orden de compra y devuelve la posición creada."""
         import uuid
@@ -1256,9 +1321,15 @@ class SmartMoneyMonitor:
         return None
 
     def get_condition_id(self, trade: dict) -> Optional[str]:
-        for key in ("conditionId", "condition_id", "market"):
-            if trade.get(key):
-                return str(trade[key])
+        # conditionId / condition_id son siempre hex válidos
+        for key in ("conditionId", "condition_id"):
+            val = trade.get(key)
+            if val:
+                return str(val)
+        # "market" puede ser slug de mercado o hex — solo usar si parece hex
+        market_val = trade.get("market")
+        if market_val and str(market_val).startswith("0x") and len(str(market_val)) > 10:
+            return str(market_val)
         return None
 
     def should_copy(self, trade: dict, wallet_name: str) -> bool:
@@ -1286,7 +1357,12 @@ class SmartMoneyMonitor:
             log.info(f"[SmartMoney] {wallet_name}: condition_id ya analizado hoy")
             return False
         if any(p.market_condition_id == condition_id for p in self.state.open_positions):
-            log.info(f"[SmartMoney] {wallet_name}: posición ya abierta en este mercado")
+            log.info(f"[SmartMoney] {wallet_name}: posición ya abierta en este mercado (condition_id)")
+            return False
+        # Check adicional por token_id para capturar mismatches de condition_id
+        token_id_check = self.get_token_id(trade)
+        if token_id_check and any(p.token_id == token_id_check for p in self.state.open_positions):
+            log.info(f"[SmartMoney] {wallet_name}: token_id ya en posición local — saltando")
             return False
         end_date_raw = trade.get("endDate") or trade.get("end_date")
         if end_date_raw:
@@ -1306,6 +1382,23 @@ class SmartMoneyMonitor:
         token_id     = self.get_token_id(trade)
         condition_id = self.get_condition_id(trade)
         if not token_id or not condition_id:
+            return None
+
+        # Guard final antes de ejecutar: chequeo local por condition_id Y token_id,
+        # más verificación en Polymarket real para evitar posiciones contradictorias.
+        if condition_id in self.state.analyzed_today:
+            log.info(f"[SmartMoney] {wallet_name}: condition_id en analyzed_today — saltando")
+            return None
+        if any(p.market_condition_id == condition_id for p in self.state.open_positions):
+            log.info(f"[SmartMoney] {wallet_name}: posición local por condition_id — saltando")
+            return None
+        if any(p.token_id == token_id for p in self.state.open_positions):
+            log.info(f"[SmartMoney] {wallet_name}: token_id ya en posición local — saltando")
+            self.state.analyzed_today.add(condition_id)
+            return None
+        if self.executor.has_market_exposure([token_id]):
+            log.warning(f"[SmartMoney] {wallet_name}: exposición real en Polymarket — saltando")
+            self.state.analyzed_today.add(condition_id)
             return None
 
         original_price = float(trade.get("price", 0))
@@ -1571,11 +1664,25 @@ class ContrarianFadeStrategy:
         if len(self.state.open_positions) >= CONFIG["MAX_OPEN_BETS"]:
             return False
 
-        # No duplicar mercado ya operado
+        # Guard 1: condition_id ya analizado o ya en posiciones locales
+        if market.condition_id in self.state.analyzed_today:
+            log.info(f"[Contrarian] condition_id ya en analyzed_today — saltando")
+            return False
         if any(p.market_condition_id == market.condition_id for p in self.state.open_positions):
+            log.info(f"[Contrarian] Ya hay posición local para este condition_id — saltando")
             return False
 
-        if market.condition_id in self.state.analyzed_today:
+        # Guard 2: verificar por token_id en posiciones locales (más fiable que condition_id)
+        all_token_ids = [o["token_id"] for o in market.outcomes if o.get("token_id")]
+        if any(p.token_id in all_token_ids for p in self.state.open_positions):
+            log.info(f"[Contrarian] token_id ya en posición local — saltando")
+            self.state.analyzed_today.add(market.condition_id)
+            return False
+
+        # Guard 3: verificar en Polymarket real (posición o orden pendiente)
+        if self.executor.has_market_exposure(all_token_ids):
+            log.warning(f"[Contrarian] Exposición real en Polymarket detectada — saltando '{market.question[:50]}'")
+            self.state.analyzed_today.add(market.condition_id)
             return False
 
         # Verificar precio mínimo válido
@@ -1701,6 +1808,10 @@ class PolymarketAgent:
                 "Ciclo cancelado para no gastar créditos de Claude."
             )
             return
+
+        # ── FASE 0: Refrescar posiciones/órdenes reales de Polymarket ────────
+        # Esto llena executor._live_token_ids para los guards de execute_fade / copy_trade
+        self.executor.refresh_live_positions()
 
         # ── FASE 1: Resetear stop diario si es nuevo día ─────────────────────
         self._check_daily_reset()
@@ -1937,7 +2048,12 @@ class PolymarketAgent:
             log.info("Nuevo día — reseteando contadores diarios")
             self.state.daily_pnl = 0
             self.state.daily_loss_triggered = False
-            self.state.analyzed_today = set()
+            # Preservar condition_ids de posiciones aún abiertas para evitar
+            # re-entrada en mercados donde ya tenemos exposición
+            open_cids = {p.market_condition_id for p in self.state.open_positions}
+            self.state.analyzed_today = open_cids
+            if open_cids:
+                log.info(f"Preservados {len(open_cids)} condition_ids de posiciones abiertas en analyzed_today")
             self.state.session_start = datetime.now().isoformat()
  
     def _print_banner(self):
