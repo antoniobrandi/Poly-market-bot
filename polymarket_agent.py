@@ -1332,7 +1332,22 @@ class SmartMoneyMonitor:
             return str(market_val)
         return None
 
+    _CRYPTO_PRICE_KEYWORDS = frozenset([
+        "bitcoin", "btc", "ethereum", "eth", "crypto", "price", "solana", "sol",
+        "xrp", "ripple", "doge", "dogecoin", "bnb", "usdc", "usdt", "stablecoin",
+        "altcoin", "defi", "nft", "token", "coin",
+    ])
+
+    @classmethod
+    def _is_crypto_price_market(cls, question: str) -> bool:
+        q = question.lower()
+        return any(kw in q for kw in cls._CRYPTO_PRICE_KEYWORDS)
+
     def should_copy(self, trade: dict, wallet_name: str) -> bool:
+        question = str(trade.get("title", trade.get("question", "")))
+        if self._is_crypto_price_market(question):
+            log.info(f"[SmartMoney] {wallet_name}: excluido por pregunta crypto/precio — '{question[:60]}'")
+            return False
         side = str(trade.get("side", "")).upper()
         if side != "BUY":
             log.info(f"[SmartMoney] {wallet_name}: descartado por side='{side}' (keys: {list(trade.keys())})")
@@ -1376,6 +1391,12 @@ class SmartMoneyMonitor:
                     return False
             except (ValueError, TypeError):
                 pass
+        # Guard por question normalizada: detecta duplicados aunque condition_id difiera entre APIs
+        question = str(trade.get("title", trade.get("question", "")))
+        norm_q = question.lower().strip()
+        if norm_q and any(p.market_question.lower().strip() == norm_q for p in self.state.open_positions):
+            log.info(f"[SmartMoney] {wallet_name}: pregunta ya en posición abierta — '{question[:60]}'")
+            return False
         return True
 
     def copy_trade(self, trade: dict, wallet_name: str) -> Optional[Position]:
@@ -1593,11 +1614,17 @@ class ContrarianFadeStrategy:
                 return o
         return None
 
+    _CRYPTO_PRICE_KEYWORDS = SmartMoneyMonitor._CRYPTO_PRICE_KEYWORDS
+
     def evaluate_market(self, market: Market) -> Optional[dict]:
         """
         Evalúa si vale la pena hacer fade en este mercado.
         Retorna dict con info del trade o None si no aplica.
         """
+        # Filtro 0: excluir mercados de precio crypto (contradiciones imposibles de gestionar)
+        if any(kw in market.question.lower() for kw in self._CRYPTO_PRICE_KEYWORDS):
+            return None
+
         # Filtro 1: días para resolución
         try:
             end_dt = datetime.fromisoformat(market.end_date.replace("Z", ""))
@@ -1676,6 +1703,13 @@ class ContrarianFadeStrategy:
         all_token_ids = [o["token_id"] for o in market.outcomes if o.get("token_id")]
         if any(p.token_id in all_token_ids for p in self.state.open_positions):
             log.info(f"[Contrarian] token_id ya en posición local — saltando")
+            self.state.analyzed_today.add(market.condition_id)
+            return False
+
+        # Guard 2b: verificar por question normalizada — detecta duplicados cross-strategy
+        norm_q = market.question.lower().strip()
+        if any(p.market_question.lower().strip() == norm_q for p in self.state.open_positions):
+            log.info(f"[Contrarian] Pregunta ya en posición abierta — saltando '{market.question[:60]}'")
             self.state.analyzed_today.add(market.condition_id)
             return False
 
