@@ -1130,7 +1130,7 @@ class OrderExecutor:
         # 2. Órdenes pendientes (limit orders en espera) vía CLOB SDK
         if self.clob is not None and not CONFIG["DRY_RUN"]:
             try:
-                orders = self.clob.get_orders()
+                orders = self.clob.get_open_orders()
                 for o in (orders or []):
                     tid = (
                         getattr(o, "asset_id", None)
@@ -1172,6 +1172,18 @@ class OrderExecutor:
         else:
             if bet_size > opp.bet_size_usd:
                 log.info(f"Apuesta ${opp.bet_size_usd:.2f} ajustada al mínimo del exchange $5")
+            # Validar que el token es operable en CLOB antes de intentar la orden.
+            # Los parlays combinados ("X AND Y") y tokens inválidos no existen
+            # en el exchange: get_tick_size lanza 404 y saltamos limpio en vez
+            # de generar un ERROR ruidoso al postear la orden.
+            try:
+                self.clob.get_tick_size(opp.token_id)
+            except Exception as e:
+                log.info(
+                    f"BUY saltado: '{opp.outcome_name}' no operable en CLOB "
+                    f"({str(e)[:80]})"
+                )
+                return None
             try:
                 order = OrderArgs(
                     token_id=opp.token_id,
