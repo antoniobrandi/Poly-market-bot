@@ -2,18 +2,26 @@
 """
 Scout de wallets para Smart Money copytrading.
 
-Baja el leaderboard de Polymarket, analiza la actividad reciente de cada
-wallet top y rankea las candidatas más compatibles con los filtros del bot
-(entradas en zona 0.15-0.85, actividad frecuente, sin mercados crypto-price).
+Dos modos (elige automáticamente):
+  1. MANUAL — si existe wallets_candidates.txt en esta carpeta (una dirección
+     0x... por línea, '#' comenta), analiza y rankea ESAS wallets. Es el modo
+     confiable: entra a polymarket.com/leaderboard, copia las addresses de los
+     traders top y pégalas ahí.
+  2. AUTO — si no hay archivo, intenta bajar el leaderboard de Polymarket
+     (el endpoint cambia seguido; si todos fallan, te dice cómo usar el modo 1).
 
-Uso (correr en una máquina con acceso a la API pública de Polymarket):
+En ambos casos rankea por compatibilidad con los filtros del bot (entradas en
+zona 0.15-0.85, actividad razonable, sin mercados crypto-price) y al final
+imprime un bloque JSON listo para pegar en wallets.json.
+
+Uso (correr donde haya acceso a la API pública de Polymarket, ej. tu Mac):
     python3 scout_wallets.py
 
 Solo lectura: no necesita credenciales ni private key.
-Al final imprime un bloque JSON listo para pegar en wallets.json.
 """
 
 import json
+import os
 import time
 from datetime import datetime, timezone
 
@@ -27,6 +35,9 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
 }
 
+CANDIDATES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "wallets_candidates.txt")
+
 # Mismos keywords que usa el bot para excluir mercados crypto-price
 CRYPTO_PRICE_KEYWORDS = frozenset([
     "bitcoin", "btc", "ethereum", "eth", "crypto", "price", "solana", "sol",
@@ -34,14 +45,44 @@ CRYPTO_PRICE_KEYWORDS = frozenset([
     "altcoin", "defi", "nft", "token", "coin",
 ])
 
+# El leaderboard de Polymarket ha cambiado de host/ruta varias veces.
+# Probamos varios candidatos; si tu diagnóstico halla uno nuevo que da 200,
+# agrégalo a esta lista.
 LEADERBOARD_CANDIDATES = [
-    (f"https://lb-api.polymarket.com/leaderboard",
-     {"window": "1m", "rankType": "pnl", "limit": 50}),
-    (f"{DATA_API}/leaderboard",
-     {"window": "1m", "limit": 50}),
-    (f"{DATA_API}/leaderboard",
-     {"window": "1m", "rankType": "pnl", "limit": 50}),
+    ("https://lb-api.polymarket.com/leaderboard", {"window": "1m", "rankType": "pnl", "limit": 50}),
+    ("https://lb-api.polymarket.com/rank",        {"window": "1m", "limit": 50}),
+    ("https://lb-api.polymarket.com/pnl",         {"window": "1m", "limit": 50}),
+    ("https://polymarket.com/api/leaderboard",    {"window": "1m", "limit": 50}),
+    (f"{DATA_API}/leaderboard",                   {"window": "1m", "rankType": "pnl", "limit": 50}),
+    (f"{DATA_API}/rankings",                      {"window": "1m", "limit": 50}),
 ]
+
+
+def load_candidates() -> list[dict]:
+    """Lee wallets_candidates.txt: una dirección 0x... por línea, '#' comenta.
+    Formato opcional: '0xADDRESS  nombre' (nombre tras espacios)."""
+    if not os.path.exists(CANDIDATES_FILE):
+        return []
+    entries = []
+    with open(CANDIDATES_FILE) as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            parts = line.split()
+            addr = parts[0]
+            # Dirección Ethereum válida: 0x + 40 hex
+            if not (addr.startswith("0x") and len(addr) == 42):
+                print(f"  ⚠ ignorada (no parece address válida): {addr}")
+                continue
+            try:
+                int(addr[2:], 16)
+            except ValueError:
+                print(f"  ⚠ ignorada (no es hex): {addr}")
+                continue
+            name = " ".join(parts[1:]) if len(parts) > 1 else ""
+            entries.append({"proxyWallet": addr, "name": name})
+    return entries
 
 
 def fetch_leaderboard() -> list[dict]:
@@ -152,15 +193,23 @@ def score(metrics: dict, pnl: float) -> float:
 
 
 def main():
-    print("Buscando leaderboard...")
-    board = fetch_leaderboard()
-    if not board:
-        print("\n❌ No se pudo bajar el leaderboard con ningún endpoint.")
-        print("   Alternativa: entra a polymarket.com/leaderboard, copia addresses")
-        print("   de traders top y agrégalas a mano a wallets.json.")
-        return
-
-    print(f"Leaderboard: {len(board)} traders. Analizando actividad (esto tarda ~1 min)...\n")
+    # Modo 1 (manual): si hay lista pegada, la usamos — es lo más confiable.
+    board = load_candidates()
+    if board:
+        print(f"📋 Modo manual: {len(board)} wallets desde wallets_candidates.txt\n")
+    else:
+        # Modo 2 (auto): intentar el leaderboard.
+        print("Buscando leaderboard (no hay wallets_candidates.txt)...")
+        board = fetch_leaderboard()
+        if not board:
+            print("\n❌ No se pudo bajar el leaderboard con ningún endpoint.")
+            print("   USA EL MODO MANUAL (más confiable):")
+            print("   1. Entra a polymarket.com/leaderboard")
+            print("   2. Copia las direcciones 0x... de los traders top")
+            print(f"   3. Pégalas (una por línea) en:\n      {CANDIDATES_FILE}")
+            print("   4. Vuelve a correr: python3 scout_wallets.py")
+            return
+        print(f"Leaderboard: {len(board)} traders. Analizando actividad (~1 min)...\n")
 
     results = []
     for entry in board[:30]:

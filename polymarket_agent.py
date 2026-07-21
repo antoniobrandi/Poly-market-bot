@@ -1414,38 +1414,38 @@ class SmartMoneyMonitor:
     def should_copy(self, trade: dict, wallet_name: str) -> bool:
         question = str(trade.get("title", trade.get("question", "")))
         if self._is_crypto_price_market(question):
-            log.info(f"[SmartMoney] {wallet_name}: excluido por pregunta crypto/precio — '{question[:60]}'")
+            log.debug(f"[SmartMoney] {wallet_name}: excluido por pregunta crypto/precio — '{question[:60]}'")
             return False
         side = str(trade.get("side", "")).upper()
         if side != "BUY":
-            log.info(f"[SmartMoney] {wallet_name}: descartado por side='{side}' (keys: {list(trade.keys())})")
+            log.debug(f"[SmartMoney] {wallet_name}: descartado por side='{side}'")
             return False
         ts = trade.get("timestamp")
         if not self.is_trade_fresh(trade):
-            log.info(f"[SmartMoney] {wallet_name}: trade no fresco (timestamp={ts!r})")
+            log.debug(f"[SmartMoney] {wallet_name}: trade no fresco (timestamp={ts!r})")
             return False
         try:
             price = float(trade.get("price", 0))
         except (ValueError, TypeError):
-            log.info(f"[SmartMoney] {wallet_name}: precio inválido ({trade.get('price')!r})")
+            log.debug(f"[SmartMoney] {wallet_name}: precio inválido ({trade.get('price')!r})")
             return False
         if not (0.15 <= price <= 0.85):
-            log.info(f"[SmartMoney] {wallet_name}: precio fuera de zona ({price:.2f})")
+            log.debug(f"[SmartMoney] {wallet_name}: precio fuera de zona ({price:.2f})")
             return False
         condition_id = self.get_condition_id(trade)
         if not condition_id:
-            log.info(f"[SmartMoney] {wallet_name}: sin condition_id (keys: {list(trade.keys())})")
+            log.debug(f"[SmartMoney] {wallet_name}: sin condition_id")
             return False
         if condition_id in self.state.analyzed_today:
-            log.info(f"[SmartMoney] {wallet_name}: condition_id ya analizado hoy")
+            log.debug(f"[SmartMoney] {wallet_name}: condition_id ya analizado hoy")
             return False
         if any(p.market_condition_id == condition_id for p in self.state.open_positions):
-            log.info(f"[SmartMoney] {wallet_name}: posición ya abierta en este mercado (condition_id)")
+            log.debug(f"[SmartMoney] {wallet_name}: posición ya abierta en este mercado (condition_id)")
             return False
         # Check adicional por token_id para capturar mismatches de condition_id
         token_id_check = self.get_token_id(trade)
         if token_id_check and any(p.token_id == token_id_check for p in self.state.open_positions):
-            log.info(f"[SmartMoney] {wallet_name}: token_id ya en posición local — saltando")
+            log.debug(f"[SmartMoney] {wallet_name}: token_id ya en posición local — saltando")
             return False
         end_date_raw = trade.get("endDate") or trade.get("end_date")
         if end_date_raw:
@@ -1455,7 +1455,7 @@ class SmartMoneyMonitor:
                 if end_dt.tzinfo is None:
                     end_dt = end_dt.replace(tzinfo=timezone.utc)
                 if end_dt <= datetime.now(timezone.utc):
-                    log.info(f"[SmartMoney] {wallet_name}: mercado ya vencido (end_date={end_date_raw})")
+                    log.debug(f"[SmartMoney] {wallet_name}: mercado ya vencido (end_date={end_date_raw})")
                     return False
             except (ValueError, TypeError):
                 pass
@@ -1463,7 +1463,7 @@ class SmartMoneyMonitor:
         question = str(trade.get("title", trade.get("question", "")))
         norm_q = question.lower().strip()
         if norm_q and any(p.market_question.lower().strip() == norm_q for p in self.state.open_positions):
-            log.info(f"[SmartMoney] {wallet_name}: pregunta ya en posición abierta — '{question[:60]}'")
+            log.debug(f"[SmartMoney] {wallet_name}: pregunta ya en posición abierta — '{question[:60]}'")
             return False
         return True
 
@@ -1568,7 +1568,14 @@ class SmartMoneyMonitor:
                 return None
         except Exception:
             pass
-        return self.executor.buy(opp)
+        position = self.executor.buy(opp)
+        if position is None:
+            # La orden no se pudo ejecutar (token inválido, mercado cerrado/
+            # resuelto, etc.). Blacklistear por hoy para no reintentar cada tick.
+            log.info(f"[SmartMoney] {wallet_name}: orden no ejecutable — "
+                     f"blacklisting '{market.question[:40]}' por hoy")
+            self.state.analyzed_today.add(condition_id)
+        return position
 
     def check_exits(self) -> list[tuple]:
         """
@@ -1640,13 +1647,26 @@ class SmartMoneyMonitor:
             if not trades:
                 log.info(f"[SmartMoney] {name}: sin trades recientes")
                 continue
-            log.info(f"[SmartMoney] {name}: {len(trades)} trades encontrados")
-            log.info(f"[SmartMoney] {name} sample trade keys: {list(trades[0].keys())}")
-            log.info(f"[SmartMoney] {name} sample trade: side={trades[0].get('side')!r} price={trades[0].get('price')!r} timestamp={trades[0].get('timestamp')!r}")
 
+            # Contadores para un resumen conciso por wallet (el detalle
+            # por-trade va a DEBUG dentro de should_copy).
+            n_sell = n_viejo = n_zona = n_copiadas = 0
             for trade in trades:
+                side = str(trade.get("side", "")).upper()
+                if side == "SELL":
+                    n_sell += 1
+                elif not self.is_trade_fresh(trade):
+                    n_viejo += 1
+                else:
+                    try:
+                        pr = float(trade.get("price", 0))
+                    except (ValueError, TypeError):
+                        pr = 0
+                    if not (0.15 <= pr <= 0.85):
+                        n_zona += 1
+
                 if copies_made >= max_copies:
-                    break
+                    continue
                 if not self.should_copy(trade, name):
                     continue
                 condition_id = self.get_condition_id(trade)
@@ -1656,8 +1676,14 @@ class SmartMoneyMonitor:
                     self.state.open_positions.append(position)
                     if condition_id:
                         self.state.analyzed_today.add(condition_id)
-                    log.info("[SmartMoney] ✅ Posición de copia abierta")
+                    log.info(f"[SmartMoney] ✅ Copia abierta: '{position.market_question[:40]}'")
                     copies_made += 1
+                    n_copiadas += 1
+
+            log.info(
+                f"[SmartMoney] {name}: {len(trades)} trades → {n_copiadas} copiadas "
+                f"({n_sell} sells, {n_viejo} viejos, {n_zona} fuera de zona)"
+            )
 
         log.info(f"[SmartMoney] Ciclo terminado: {copies_made} copias")
         return copies_made
