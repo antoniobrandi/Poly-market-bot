@@ -81,9 +81,21 @@ CONFIG = {
     "MIN_VOLUME":           float(os.getenv("MIN_VOLUME", "5000")),
 
     # ── Operación ───────────────────────────────────────────
+    # Interruptor maestro: fuerza a cero TODAS las rutas que gastan API de pago.
+    # Con FREE_ONLY=true el bot no puede cobrar aunque el .env diga otra cosa.
+    "FREE_ONLY":            os.getenv("FREE_ONLY", "true").lower() == "true",
     "SCAN_INTERVAL_MIN":    int(os.getenv("SCAN_INTERVAL_MIN", "60")),
     # 0 = modo gratuito: sin análisis Claude (la única estrategia que paga API)
     "MAX_MARKETS_PER_RUN":  int(os.getenv("MAX_MARKETS_PER_RUN", "0")),
+    # Servidor keep-alive Flask: innecesario bajo systemd (default apagado)
+    "KEEPALIVE_ENABLED":    os.getenv("KEEPALIVE_ENABLED", "false").lower() == "true",
+    "KEEPALIVE_HOST":       os.getenv("KEEPALIVE_HOST", "127.0.0.1"),
+
+    # ── Toggles de estrategias gratis ───────────────────────
+    "LATE_RESOLUTION_ENABLED": os.getenv("LATE_RESOLUTION_ENABLED", "true").lower() == "true",
+    # Arbitraje correlacionado: NO es arbitraje real (compra una sola pata,
+    # sin cubrir) y agrupa por regex → falsos positivos. Apagado por default.
+    "CORRELATED_ARB_ENABLED":  os.getenv("CORRELATED_ARB_ENABLED", "false").lower() == "true",
     "PRE_FILTER_BATCH_SIZE": int(os.getenv("PRE_FILTER_BATCH_SIZE", "40")),  # max mercados al pre-filtro
     "PRE_FILTER_TOP_N":      int(os.getenv("PRE_FILTER_TOP_N", "5")),        # cuántos pasan a análisis profundo
     "DRY_RUN":              os.getenv("DRY_RUN", "true").lower() == "true",
@@ -99,9 +111,14 @@ CONFIG = {
     "SMART_MONEY_MAX_COPIES":   int(os.getenv("SMART_MONEY_MAX_COPIES", "2")),
     "SMART_MONEY_BET_PCT":      float(os.getenv("SMART_MONEY_BET_PCT", "0.03")),
     "SMART_MONEY_MAX_SLIPPAGE": float(os.getenv("SMART_MONEY_MAX_SLIPPAGE", "0.10")),
+    # Consenso: nº de wallets distintas que deben haber comprado el mismo
+    # token para copiarlo. 1 = comportamiento clásico; 2+ = exigir confirmación.
+    "SMART_MONEY_MIN_CONSENSUS": int(os.getenv("SMART_MONEY_MIN_CONSENSUS", "1")),
 
     # ── Contrarian Fade ─────────────────────────────────
-    "CONTRARIAN_ENABLED":      os.getenv("CONTRARIAN_ENABLED", "true").lower() == "true",
+    # Tesis frágil (un movimiento fuerte puede ser noticia real, no ruido).
+    # Apagada por default; prender solo para experimentar.
+    "CONTRARIAN_ENABLED":      os.getenv("CONTRARIAN_ENABLED", "false").lower() == "true",
     "CONTRARIAN_MIN_MOVE":     float(os.getenv("CONTRARIAN_MIN_MOVE", "0.10")),
     "CONTRARIAN_MAX_MOVE":     float(os.getenv("CONTRARIAN_MAX_MOVE", "0.40")),
     "CONTRARIAN_BET_USD":      float(os.getenv("CONTRARIAN_BET_USD", "2.0")),
@@ -112,7 +129,16 @@ CONFIG = {
     "CONTRARIAN_MIN_DAYS_LEFT": int(os.getenv("CONTRARIAN_MIN_DAYS_LEFT", "2")),
     "CONTRARIAN_MAX_MARKETS_TO_SCAN": int(os.getenv("CONTRARIAN_MAX_MARKETS_TO_SCAN", "30")),
 }
- 
+
+# ── Blindaje de costos ──────────────────────────────────────
+# Hay DOS rutas que gastan API de pago (Anthropic):
+#   1. MAX_MARKETS_PER_RUN > 0  → análisis de ENTRADA con Claude
+#   2. CLOSE_IF_EDGE_GONE=true  → análisis de SALIDA con Claude
+# FREE_ONLY las fuerza a cero para que un .env mal configurado no cobre.
+if CONFIG["FREE_ONLY"]:
+    CONFIG["MAX_MARKETS_PER_RUN"] = 0
+    CONFIG["CLOSE_IF_EDGE_GONE"] = False
+
 # ═══════════════════════════════════════════════════════════
 #  SMART MONEY WALLETS
 #  Se cargan de wallets.json (editable sin tocar código);
@@ -1624,6 +1650,21 @@ class SmartMoneyMonitor:
                     break
         return to_close
 
+    def _build_consensus(self, trades_by_wallet: dict) -> dict:
+        """token_id → nº de wallets DISTINTAS con un BUY fresco en ese token.
+        Sirve para exigir confirmación de varias wallets antes de copiar."""
+        consensus: dict[str, set] = {}
+        for address, trades in (trades_by_wallet or {}).items():
+            for t in (trades or []):
+                if str(t.get("side", "")).upper() != "BUY":
+                    continue
+                if not self.is_trade_fresh(t):
+                    continue
+                tid = self.get_token_id(t)
+                if tid:
+                    consensus.setdefault(tid, set()).add(address)
+        return {tid: len(wallets) for tid, wallets in consensus.items()}
+
     def run(self) -> int:
         if not CONFIG["SMART_MONEY_ENABLED"]:
             return 0
@@ -1637,12 +1678,23 @@ class SmartMoneyMonitor:
         max_copies  = min(CONFIG["SMART_MONEY_MAX_COPIES"], slots)
         log.info(f"[SmartMoney] Monitoreando {len(SMART_WALLETS)} wallets...")
 
+        # Un solo fetch por wallet: se reusa para el consenso y para el loop.
+        trades_by_wallet = {w["address"]: self.fetch_recent_trades(w["address"])
+                            for w in SMART_WALLETS}
+
+        # Consenso: cuántas wallets DISTINTAS compraron (BUY fresco) cada token.
+        consensus = self._build_consensus(trades_by_wallet)
+        min_consensus = max(1, CONFIG["SMART_MONEY_MIN_CONSENSUS"])
+        if min_consensus > 1:
+            confirmados = sum(1 for c in consensus.values() if c >= min_consensus)
+            log.info(f"[SmartMoney] Consenso ≥{min_consensus}: {confirmados} tokens confirmados")
+
         for wallet_info in SMART_WALLETS:
             if copies_made >= max_copies:
                 break
             address = wallet_info["address"]
             name    = wallet_info["name"]
-            trades  = self.fetch_recent_trades(address)
+            trades  = trades_by_wallet.get(address) or []
 
             if not trades:
                 log.info(f"[SmartMoney] {name}: sin trades recientes")
@@ -1669,6 +1721,18 @@ class SmartMoneyMonitor:
                     continue
                 if not self.should_copy(trade, name):
                     continue
+                # Filtro de consenso: exigir que N wallets distintas hayan
+                # comprado este mismo token (señal confirmada, no de una sola).
+                tid = self.get_token_id(trade)
+                n_conf = consensus.get(tid, 0) if tid else 0
+                if n_conf < min_consensus:
+                    log.info(
+                        f"[SmartMoney] {name}: saltado por consenso insuficiente "
+                        f"({n_conf} < {min_consensus}) — '{str(trade.get('title',''))[:40]}'"
+                    )
+                    continue
+                if min_consensus > 1:
+                    log.info(f"[SmartMoney] consenso {n_conf}/{min_consensus} confirmado")
                 condition_id = self.get_condition_id(trade)
                 position = self.copy_trade(trade, name)
                 if position:
@@ -1971,23 +2035,54 @@ class PolymarketAgent:
         log.info(f"[SmartMoney] {len(SMART_WALLETS)} wallets cargadas ({wallets_src})")
         self._print_banner()
  
+    def _install_signal_handlers(self):
+        """SIGTERM (systemctl stop/restart) y SIGINT → salida limpia."""
+        import signal
+
+        def _handler(signum, _frame):
+            log.info(f"Señal {signum} recibida — cerrando limpio...")
+            self._stop = True
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                signal.signal(sig, _handler)
+            except (ValueError, OSError):
+                pass  # p.ej. si no estamos en el hilo principal
+
     def run(self):
-        log.info("Agente iniciado. Ctrl+C para detener.")
+        log.info("Agente iniciado. Ctrl+C (o systemctl stop) para detener.")
+        self._stop = False
+        self._install_signal_handlers()
         fast_min = max(1, CONFIG["SMART_MONEY_INTERVAL_MIN"])
         scan_min = max(fast_min, CONFIG["SCAN_INTERVAL_MIN"])
         log.info(f"Loop: tick copytrading cada {fast_min} min | scan completo cada {scan_min} min")
         last_full_scan = 0.0
         try:
-            while True:
-                if time.time() - last_full_scan >= scan_min * 60:
-                    self._run_cycle()
-                    last_full_scan = time.time()
-                else:
-                    self._fast_tick()
-                StatePersistence.save(self.state)
-                time.sleep(fast_min * 60)
+            while not self._stop:
+                # Un fallo en un ciclo NO debe matar el proceso: se loguea y
+                # se sigue al siguiente tick (operación desatendida 24/7).
+                try:
+                    if time.time() - last_full_scan >= scan_min * 60:
+                        self._run_cycle()
+                        last_full_scan = time.time()
+                    else:
+                        self._fast_tick()
+                except Exception:
+                    log.exception("Error no manejado en el ciclo — continuando")
+
+                try:
+                    StatePersistence.save(self.state)
+                except Exception:
+                    log.exception("Error guardando estado")
+
+                # Dormir en tramos cortos para reaccionar rápido a SIGTERM
+                for _ in range(int(fast_min * 60)):
+                    if self._stop:
+                        break
+                    time.sleep(1)
         except KeyboardInterrupt:
             log.info("Detenido manualmente.")
+        finally:
             StatePersistence.save(self.state)
             self._print_summary()
 
@@ -2045,7 +2140,7 @@ class PolymarketAgent:
         # ── ESTRATEGIA A: Resolución tardía (GRATIS — sin Claude) ────────────
         # No usa analyzed_today: mercados pueden permanecer sin resolver varios días,
         # y necesitamos poder reentrar si la posición anterior ya se cerró.
-        late_markets = self.scanner.find_late_resolution()
+        late_markets = self.scanner.find_late_resolution() if CONFIG["LATE_RESOLUTION_ENABLED"] else []
         for m in late_markets[:3]:
             if slots <= 0:
                 break
@@ -2079,15 +2174,22 @@ class PolymarketAgent:
             )
             position = self.executor.buy(opp)
             if position:
-                self.state.bankroll -= bet_size
+                # Descontar el gasto REAL: buy() sube la apuesta al mínimo
+                # del exchange ($5), que puede ser mayor que bet_size.
+                self.state.bankroll -= position.size_usd
                 self.state.open_positions.append(position)
                 slots -= 1
                 log.info("  Posición de resolución tardía abierta")
 
-        # ── ESTRATEGIA B: Arbitraje correlacionado (GRATIS — sin Claude) ─────
+        # Mercados activos: los usan la Estrategia B, Contrarian y la C (IA).
+        # Se descargan siempre porque las estrategias de abajo dependen de ellos.
         all_markets_raw = self.scanner.get_active_markets()
-        all_markets_filtered = self.scanner.filter_markets(all_markets_raw)
-        arb_opps = self.scanner.find_correlated_arbitrage(all_markets_filtered)
+
+        # ── ESTRATEGIA B: Arbitraje correlacionado (GRATIS — sin Claude) ─────
+        arb_opps = []
+        if CONFIG["CORRELATED_ARB_ENABLED"]:
+            all_markets_filtered = self.scanner.filter_markets(all_markets_raw)
+            arb_opps = self.scanner.find_correlated_arbitrage(all_markets_filtered)
         for arb in arb_opps[:2]:
             if slots <= 0:
                 break
@@ -2116,7 +2218,8 @@ class PolymarketAgent:
             )
             position = self.executor.buy(opp)
             if position:
-                self.state.bankroll -= bet_size
+                # Gasto real (buy() aplica el mínimo de $5 del exchange)
+                self.state.bankroll -= position.size_usd
                 self.state.open_positions.append(position)
                 slots -= 1
                 log.info("  Posición de arbitraje abierta")
@@ -2348,12 +2451,13 @@ def run_keep_alive():
         return {"status": "alive"}, 200
 
     port = int(os.getenv("PORT", 8080))
+    host = CONFIG["KEEPALIVE_HOST"]   # 127.0.0.1 por default: no exponer
     thread = threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=port, use_reloader=False),
+        target=lambda: app.run(host=host, port=port, use_reloader=False),
         daemon=True,
     )
     thread.start()
-    log.info(f"Keep-alive server corriendo en puerto {port}")
+    log.info(f"Keep-alive server corriendo en {host}:{port}")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -2365,7 +2469,19 @@ if __name__ == "__main__":
         print("ERROR: Falta ANTHROPIC_API_KEY en el .env "
               "(o usa MAX_MARKETS_PER_RUN=0 para modo gratuito sin IA)")
         sys.exit(1)
-    if not CONFIG["ANTHROPIC_API_KEY"]:
+    if CONFIG["FREE_ONLY"]:
+        log.info("💸 FREE_ONLY activo — cero llamadas de pago (solo estrategias gratis)")
+    elif not CONFIG["ANTHROPIC_API_KEY"]:
         log.info("💸 Modo gratuito — sin análisis IA, solo estrategias sin costo")
-    run_keep_alive()
+    activas = [n for n, on in (
+        ("SmartMoney", CONFIG["SMART_MONEY_ENABLED"]),
+        ("ResoluciónTardía", CONFIG["LATE_RESOLUTION_ENABLED"]),
+        ("Arbitraje", CONFIG["CORRELATED_ARB_ENABLED"]),
+        ("Contrarian", CONFIG["CONTRARIAN_ENABLED"]),
+        ("EdgeIA", CONFIG["MAX_MARKETS_PER_RUN"] > 0),
+    ) if on]
+    log.info(f"Estrategias activas: {', '.join(activas) if activas else 'NINGUNA'}")
+    # Bajo systemd no hace falta el keep-alive (evita choque de puertos)
+    if CONFIG["KEEPALIVE_ENABLED"]:
+        run_keep_alive()
     PolymarketAgent().run()

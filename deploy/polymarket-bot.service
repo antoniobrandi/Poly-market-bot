@@ -1,0 +1,44 @@
+[Unit]
+Description=Polymarket Copytrading Bot
+Documentation=https://github.com/antoniobrandi/Poly-market-bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# ── AJUSTA ESTOS 3 VALORES A TU SERVIDOR ──────────────────────
+User=botuser
+WorkingDirectory=/opt/poly-market-bot
+ExecStart=/opt/poly-market-bot/venv/bin/python /opt/poly-market-bot/polymarket_agent.py
+# ──────────────────────────────────────────────────────────────
+
+EnvironmentFile=/opt/poly-market-bot/.env
+# Logs sin buffer: aparecen en journalctl al instante
+Environment=PYTHONUNBUFFERED=1
+
+# Reinicio automático ante cualquier caída
+Restart=always
+RestartSec=30
+# Si crashea 5 veces en 10 min, parar (evita crash-loop infinito)
+StartLimitBurst=5
+StartLimitIntervalSec=600
+
+# Cierre limpio: el bot atrapa SIGTERM y guarda agent_state.json
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polymarket-bot
+
+# ── Endurecimiento básico ─────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+# El bot necesita escribir agent_state.json y su log en su carpeta
+ReadWritePaths=/opt/poly-market-bot
+
+[Install]
+WantedBy=multi-user.target
