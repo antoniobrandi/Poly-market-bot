@@ -1,0 +1,16 @@
+# Candidatas para el scout de wallets.
+#
+# Cómo usar:
+#   1. Copia este archivo a "wallets_candidates.txt" (quita el .example)
+#   2. Entra a polymarket.com/leaderboard, abre el perfil de un trader top
+#      y copia su dirección 0x... (sale en la URL del perfil)
+#   3. Pega una dirección por línea aquí (opcional: un nombre después de espacios)
+#   4. Corre: python3 scout_wallets.py
+#
+# El scout analiza cada wallet y te dice cuáles son buenas para copiar
+# (entradas en zona 0.15-0.85, actividad razonable, sin crypto-price),
+# e imprime un bloque JSON listo para pegar en wallets.json.
+#
+# Ejemplo (borra estas y pon las tuyas):
+0x30d1c420d1abde9442d6762dd6f6d5f92df04525  randomWalkingS
+0xffb0b9b292e406fd250854a35a0c9bd5612aFa37  BloodyMummer

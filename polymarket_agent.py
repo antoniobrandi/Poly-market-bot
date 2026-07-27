@@ -26,6 +26,7 @@ import time
 import logging
 from datetime import datetime
 from typing import Optional
+import dataclasses
 from dataclasses import dataclass, field
 from dotenv import load_dotenv
  
@@ -80,8 +81,21 @@ CONFIG = {
     "MIN_VOLUME":           float(os.getenv("MIN_VOLUME", "5000")),
 
     # ── Operación ───────────────────────────────────────────
+    # Interruptor maestro: fuerza a cero TODAS las rutas que gastan API de pago.
+    # Con FREE_ONLY=true el bot no puede cobrar aunque el .env diga otra cosa.
+    "FREE_ONLY":            os.getenv("FREE_ONLY", "true").lower() == "true",
     "SCAN_INTERVAL_MIN":    int(os.getenv("SCAN_INTERVAL_MIN", "60")),
-    "MAX_MARKETS_PER_RUN":  int(os.getenv("MAX_MARKETS_PER_RUN", "5")),
+    # 0 = modo gratuito: sin análisis Claude (la única estrategia que paga API)
+    "MAX_MARKETS_PER_RUN":  int(os.getenv("MAX_MARKETS_PER_RUN", "0")),
+    # Servidor keep-alive Flask: innecesario bajo systemd (default apagado)
+    "KEEPALIVE_ENABLED":    os.getenv("KEEPALIVE_ENABLED", "false").lower() == "true",
+    "KEEPALIVE_HOST":       os.getenv("KEEPALIVE_HOST", "127.0.0.1"),
+
+    # ── Toggles de estrategias gratis ───────────────────────
+    "LATE_RESOLUTION_ENABLED": os.getenv("LATE_RESOLUTION_ENABLED", "true").lower() == "true",
+    # Arbitraje correlacionado: NO es arbitraje real (compra una sola pata,
+    # sin cubrir) y agrupa por regex → falsos positivos. Apagado por default.
+    "CORRELATED_ARB_ENABLED":  os.getenv("CORRELATED_ARB_ENABLED", "false").lower() == "true",
     "PRE_FILTER_BATCH_SIZE": int(os.getenv("PRE_FILTER_BATCH_SIZE", "40")),  # max mercados al pre-filtro
     "PRE_FILTER_TOP_N":      int(os.getenv("PRE_FILTER_TOP_N", "5")),        # cuántos pasan a análisis profundo
     "DRY_RUN":              os.getenv("DRY_RUN", "true").lower() == "true",
@@ -90,13 +104,21 @@ CONFIG = {
 
     # ── Smart Money Following ──────────────────────────────────────────
     "SMART_MONEY_ENABLED":      os.getenv("SMART_MONEY_ENABLED", "true").lower() == "true",
+    # Tick rápido: copytrading + monitoreo de posiciones corren cada N min
+    # (el escaneo completo de mercados sigue cada SCAN_INTERVAL_MIN)
+    "SMART_MONEY_INTERVAL_MIN": int(os.getenv("SMART_MONEY_INTERVAL_MIN", "15")),
     "SMART_MONEY_MAX_HOURS":    int(os.getenv("SMART_MONEY_MAX_HOURS", "72")),
     "SMART_MONEY_MAX_COPIES":   int(os.getenv("SMART_MONEY_MAX_COPIES", "2")),
     "SMART_MONEY_BET_PCT":      float(os.getenv("SMART_MONEY_BET_PCT", "0.03")),
     "SMART_MONEY_MAX_SLIPPAGE": float(os.getenv("SMART_MONEY_MAX_SLIPPAGE", "0.10")),
+    # Consenso: nº de wallets distintas que deben haber comprado el mismo
+    # token para copiarlo. 1 = comportamiento clásico; 2+ = exigir confirmación.
+    "SMART_MONEY_MIN_CONSENSUS": int(os.getenv("SMART_MONEY_MIN_CONSENSUS", "1")),
 
     # ── Contrarian Fade ─────────────────────────────────
-    "CONTRARIAN_ENABLED":      os.getenv("CONTRARIAN_ENABLED", "true").lower() == "true",
+    # Tesis frágil (un movimiento fuerte puede ser noticia real, no ruido).
+    # Apagada por default; prender solo para experimentar.
+    "CONTRARIAN_ENABLED":      os.getenv("CONTRARIAN_ENABLED", "false").lower() == "true",
     "CONTRARIAN_MIN_MOVE":     float(os.getenv("CONTRARIAN_MIN_MOVE", "0.10")),
     "CONTRARIAN_MAX_MOVE":     float(os.getenv("CONTRARIAN_MAX_MOVE", "0.40")),
     "CONTRARIAN_BET_USD":      float(os.getenv("CONTRARIAN_BET_USD", "2.0")),
@@ -107,11 +129,22 @@ CONFIG = {
     "CONTRARIAN_MIN_DAYS_LEFT": int(os.getenv("CONTRARIAN_MIN_DAYS_LEFT", "2")),
     "CONTRARIAN_MAX_MARKETS_TO_SCAN": int(os.getenv("CONTRARIAN_MAX_MARKETS_TO_SCAN", "30")),
 }
- 
+
+# ── Blindaje de costos ──────────────────────────────────────
+# Hay DOS rutas que gastan API de pago (Anthropic):
+#   1. MAX_MARKETS_PER_RUN > 0  → análisis de ENTRADA con Claude
+#   2. CLOSE_IF_EDGE_GONE=true  → análisis de SALIDA con Claude
+# FREE_ONLY las fuerza a cero para que un .env mal configurado no cobre.
+if CONFIG["FREE_ONLY"]:
+    CONFIG["MAX_MARKETS_PER_RUN"] = 0
+    CONFIG["CLOSE_IF_EDGE_GONE"] = False
+
 # ═══════════════════════════════════════════════════════════
 #  SMART MONEY WALLETS
+#  Se cargan de wallets.json (editable sin tocar código);
+#  fallback a esta lista si el archivo no existe o es inválido.
 # ═══════════════════════════════════════════════════════════
-SMART_WALLETS = [
+_DEFAULT_SMART_WALLETS = [
     {
         "address":    "0x30d1c420d1abde9442d6762dd6f6d5f92df04525",
         "name":       "randomWalkingS",
@@ -133,6 +166,25 @@ SMART_WALLETS = [
         "categories": "UFC/MLB",
     },
 ]
+
+WALLETS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wallets.json")
+
+def _load_smart_wallets() -> list[dict]:
+    try:
+        with open(WALLETS_FILE) as f:
+            wallets = json.load(f)
+        valid = [w for w in wallets
+                 if isinstance(w, dict) and w.get("address", "").startswith("0x")]
+        if valid:
+            return valid
+        logging.warning(f"wallets.json sin wallets válidas — usando lista por defecto")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logging.warning(f"Error leyendo wallets.json ({e}) — usando lista por defecto")
+    return _DEFAULT_SMART_WALLETS
+
+SMART_WALLETS = _load_smart_wallets()
 
 POLYMARKET_DATA_API = "https://data-api.polymarket.com"
 
@@ -176,7 +228,10 @@ class Opportunity:
     bet_size_usd: float
     reasoning: str
     confidence: str
- 
+    strategy: str = ""         # SMART_MONEY | LATE_RESOLUTION | ARB | CONTRARIAN | AI
+    source_wallet: str = ""    # address de la wallet copiada (solo SMART_MONEY)
+    source_name: str = ""      # nombre legible de la wallet copiada
+
 @dataclass
 class Position:
     id: str                    # UUID único
@@ -191,6 +246,9 @@ class Position:
     end_date: str              # fecha de resolución
     opened_at: str
     status: str = "OPEN"       # OPEN | CLOSED_PROFIT | CLOSED_LOSS | RESOLVED
+    strategy: str = ""         # SMART_MONEY | LATE_RESOLUTION | ARB | CONTRARIAN | AI
+    source_wallet: str = ""    # address de la wallet copiada (solo SMART_MONEY)
+    source_name: str = ""      # nombre legible de la wallet copiada
  
 @dataclass
 class CloseDecision:
@@ -211,6 +269,7 @@ class AgentState:
     daily_pnl: float = 0.0
     daily_loss_triggered: bool = False
     analyzed_today: set = field(default_factory=set)
+    wallet_pnl: dict = field(default_factory=dict)   # PnL acumulado por wallet copiada
     session_start: str = field(default_factory=lambda: datetime.now().isoformat())
  
     @property
@@ -656,10 +715,17 @@ class PolymarketScanner:
 class ClaudeAnalyzer:
  
     def __init__(self):
-        self.client = anthropic.Anthropic(api_key=CONFIG["ANTHROPIC_API_KEY"])
- 
+        # Sin key el bot corre en modo gratuito: los métodos que analizan
+        # con IA se vuelven no-ops en lugar de tronar.
+        if CONFIG["ANTHROPIC_API_KEY"]:
+            self.client = anthropic.Anthropic(api_key=CONFIG["ANTHROPIC_API_KEY"])
+        else:
+            self.client = None
+
     def analyze_market(self, market: Market, bankroll: float) -> Optional[Opportunity]:
         """Analiza un mercado para detectar edge de entrada."""
+        if self.client is None:
+            return None
         outcomes_str = "\n".join(
             f"  - {o['name']}: precio = {o['price']:.3f} ({o['price']*100:.1f}%)"
             for o in market.outcomes
@@ -736,6 +802,7 @@ Si el edge es menor a 5% o no tienes info suficiente: has_edge: false, edge: 0."
                 bet_size_usd=bet,
                 reasoning=result.get("reasoning", result.get("analysis", "")),
                 confidence=confidence,
+                strategy="AI",
             )
         except Exception as e:
             log.error(f"Error analizando '{market.question[:50]}': {e}")
@@ -747,6 +814,9 @@ Si el edge es menor a 5% o no tienes info suficiente: has_edge: false, edge: 0."
         Se llama cuando las reglas mecánicas no son suficientes.
         """
         pnl_pct = (current_price - position.entry_price) / position.entry_price * 100
+        if self.client is None:
+            pnl_usd = (current_price - position.entry_price) * position.shares
+            return CloseDecision(False, "Sin IA (modo gratuito)", current_price, pnl_usd, pnl_pct)
         prompt = f"""Tienes una posición abierta en Polymarket. Decide si conviene CERRAR ahora o MANTENER.
  
 POSICIÓN:
@@ -825,6 +895,8 @@ RESPONDE SOLO EN JSON:
         el análisis profundo (ahorra ~$0.40).
         """
         if not markets:
+            return []
+        if self.client is None:
             return []
 
         top_n = CONFIG["PRE_FILTER_TOP_N"]
@@ -1084,7 +1156,7 @@ class OrderExecutor:
         # 2. Órdenes pendientes (limit orders en espera) vía CLOB SDK
         if self.clob is not None and not CONFIG["DRY_RUN"]:
             try:
-                orders = self.clob.get_orders()
+                orders = self.clob.get_open_orders()
                 for o in (orders or []):
                     tid = (
                         getattr(o, "asset_id", None)
@@ -1126,6 +1198,18 @@ class OrderExecutor:
         else:
             if bet_size > opp.bet_size_usd:
                 log.info(f"Apuesta ${opp.bet_size_usd:.2f} ajustada al mínimo del exchange $5")
+            # Validar que el token es operable en CLOB antes de intentar la orden.
+            # Los parlays combinados ("X AND Y") y tokens inválidos no existen
+            # en el exchange: get_tick_size lanza 404 y saltamos limpio en vez
+            # de generar un ERROR ruidoso al postear la orden.
+            try:
+                self.clob.get_tick_size(opp.token_id)
+            except Exception as e:
+                log.info(
+                    f"BUY saltado: '{opp.outcome_name}' no operable en CLOB "
+                    f"({str(e)[:80]})"
+                )
+                return None
             try:
                 order = OrderArgs(
                     token_id=opp.token_id,
@@ -1150,6 +1234,9 @@ class OrderExecutor:
             ai_probability=opp.ai_probability,
             end_date=opp.market.end_date,
             opened_at=datetime.now().isoformat(),
+            strategy=opp.strategy,
+            source_wallet=opp.source_wallet,
+            source_name=opp.source_name,
         )
  
     def sell(self, position: Position, current_price: float) -> float:
@@ -1236,6 +1323,7 @@ class StatePersistence:
             "total_returned": state.total_returned,
             "session_start": state.session_start,
             "analyzed_today": list(state.analyzed_today),
+            "wallet_pnl": state.wallet_pnl,
             "open_positions": [vars(p) for p in state.open_positions],
             "closed_positions": [vars(p) for p in state.closed_positions[-100:]],  # últimas 100
         }
@@ -1259,8 +1347,14 @@ class StatePersistence:
             state.total_returned = data.get("total_returned", 0)
             state.session_start = data.get("session_start", datetime.now().isoformat())
             state.analyzed_today = set(data.get("analyzed_today", []))
-            state.open_positions = [Position(**p) for p in data.get("open_positions", [])]
-            state.closed_positions = [Position(**p) for p in data.get("closed_positions", [])]
+            state.wallet_pnl = data.get("wallet_pnl", {})
+            # Filtrar keys desconocidas: posiciones guardadas por versiones
+            # anteriores/posteriores del dataclass no deben tirar el estado
+            pos_fields = {f.name for f in dataclasses.fields(Position)}
+            def _mk_pos(p: dict) -> Position:
+                return Position(**{k: v for k, v in p.items() if k in pos_fields})
+            state.open_positions = [_mk_pos(p) for p in data.get("open_positions", [])]
+            state.closed_positions = [_mk_pos(p) for p in data.get("closed_positions", [])]
             log.info(f"Estado cargado: bankroll=${state.bankroll:.2f} | {len(state.open_positions)} posiciones abiertas")
             return state
         except Exception as e:
@@ -1346,38 +1440,38 @@ class SmartMoneyMonitor:
     def should_copy(self, trade: dict, wallet_name: str) -> bool:
         question = str(trade.get("title", trade.get("question", "")))
         if self._is_crypto_price_market(question):
-            log.info(f"[SmartMoney] {wallet_name}: excluido por pregunta crypto/precio — '{question[:60]}'")
+            log.debug(f"[SmartMoney] {wallet_name}: excluido por pregunta crypto/precio — '{question[:60]}'")
             return False
         side = str(trade.get("side", "")).upper()
         if side != "BUY":
-            log.info(f"[SmartMoney] {wallet_name}: descartado por side='{side}' (keys: {list(trade.keys())})")
+            log.debug(f"[SmartMoney] {wallet_name}: descartado por side='{side}'")
             return False
         ts = trade.get("timestamp")
         if not self.is_trade_fresh(trade):
-            log.info(f"[SmartMoney] {wallet_name}: trade no fresco (timestamp={ts!r})")
+            log.debug(f"[SmartMoney] {wallet_name}: trade no fresco (timestamp={ts!r})")
             return False
         try:
             price = float(trade.get("price", 0))
         except (ValueError, TypeError):
-            log.info(f"[SmartMoney] {wallet_name}: precio inválido ({trade.get('price')!r})")
+            log.debug(f"[SmartMoney] {wallet_name}: precio inválido ({trade.get('price')!r})")
             return False
         if not (0.15 <= price <= 0.85):
-            log.info(f"[SmartMoney] {wallet_name}: precio fuera de zona ({price:.2f})")
+            log.debug(f"[SmartMoney] {wallet_name}: precio fuera de zona ({price:.2f})")
             return False
         condition_id = self.get_condition_id(trade)
         if not condition_id:
-            log.info(f"[SmartMoney] {wallet_name}: sin condition_id (keys: {list(trade.keys())})")
+            log.debug(f"[SmartMoney] {wallet_name}: sin condition_id")
             return False
         if condition_id in self.state.analyzed_today:
-            log.info(f"[SmartMoney] {wallet_name}: condition_id ya analizado hoy")
+            log.debug(f"[SmartMoney] {wallet_name}: condition_id ya analizado hoy")
             return False
         if any(p.market_condition_id == condition_id for p in self.state.open_positions):
-            log.info(f"[SmartMoney] {wallet_name}: posición ya abierta en este mercado (condition_id)")
+            log.debug(f"[SmartMoney] {wallet_name}: posición ya abierta en este mercado (condition_id)")
             return False
         # Check adicional por token_id para capturar mismatches de condition_id
         token_id_check = self.get_token_id(trade)
         if token_id_check and any(p.token_id == token_id_check for p in self.state.open_positions):
-            log.info(f"[SmartMoney] {wallet_name}: token_id ya en posición local — saltando")
+            log.debug(f"[SmartMoney] {wallet_name}: token_id ya en posición local — saltando")
             return False
         end_date_raw = trade.get("endDate") or trade.get("end_date")
         if end_date_raw:
@@ -1387,7 +1481,7 @@ class SmartMoneyMonitor:
                 if end_dt.tzinfo is None:
                     end_dt = end_dt.replace(tzinfo=timezone.utc)
                 if end_dt <= datetime.now(timezone.utc):
-                    log.info(f"[SmartMoney] {wallet_name}: mercado ya vencido (end_date={end_date_raw})")
+                    log.debug(f"[SmartMoney] {wallet_name}: mercado ya vencido (end_date={end_date_raw})")
                     return False
             except (ValueError, TypeError):
                 pass
@@ -1395,7 +1489,7 @@ class SmartMoneyMonitor:
         question = str(trade.get("title", trade.get("question", "")))
         norm_q = question.lower().strip()
         if norm_q and any(p.market_question.lower().strip() == norm_q for p in self.state.open_positions):
-            log.info(f"[SmartMoney] {wallet_name}: pregunta ya en posición abierta — '{question[:60]}'")
+            log.debug(f"[SmartMoney] {wallet_name}: pregunta ya en posición abierta — '{question[:60]}'")
             return False
         return True
 
@@ -1439,14 +1533,19 @@ class SmartMoneyMonitor:
             log.info(f"[SmartMoney] {wallet_name}: precio actual fuera de zona ({current_price:.3f})")
             return None
 
+        # Piso $5 = mínimo real del exchange (buy() lo subiría igual);
+        # buffer chico para que un bankroll de $5 pueda operar 1 posición
         bet_size = round(
-            max(CONFIG["MIN_BET_USD"],
+            max(5.0,
                 min(CONFIG["MAX_BET_USD"],
                     self.state.bankroll * CONFIG["SMART_MONEY_BET_PCT"])),
             2
         )
-        if self.state.bankroll < bet_size + 5:
-            log.warning("[SmartMoney] Bankroll insuficiente")
+        if self.state.bankroll < bet_size + 0.5:
+            log.warning(
+                f"[SmartMoney] Bankroll insuficiente "
+                f"(${self.state.bankroll:.2f} < ${bet_size + 0.5:.2f})"
+            )
             return None
 
         market = Market(
@@ -1471,6 +1570,9 @@ class SmartMoneyMonitor:
             bet_size_usd=bet_size,
             reasoning=f"Smart Money copy de {wallet_name}",
             confidence="MEDIUM",
+            strategy="SMART_MONEY",
+            source_wallet=str(trade.get("proxyWallet", "")),
+            source_name=wallet_name,
         )
         log.info(
             f"[SmartMoney] 🐋 COPIANDO {wallet_name}: '{market.question[:50]}' | "
@@ -1492,7 +1594,76 @@ class SmartMoneyMonitor:
                 return None
         except Exception:
             pass
-        return self.executor.buy(opp)
+        position = self.executor.buy(opp)
+        if position is None:
+            # La orden no se pudo ejecutar (token inválido, mercado cerrado/
+            # resuelto, etc.). Blacklistear por hoy para no reintentar cada tick.
+            log.info(f"[SmartMoney] {wallet_name}: orden no ejecutable — "
+                     f"blacklisting '{market.question[:40]}' por hoy")
+            self.state.analyzed_today.add(condition_id)
+        return position
+
+    def check_exits(self) -> list[tuple]:
+        """
+        Copy-exit: si la wallet origen vendió el mismo token después de que
+        abrimos la copia, devolver [(position, precio_actual, nombre_wallet)]
+        para que el agente cierre con su flujo normal de contabilidad.
+        """
+        if not CONFIG["SMART_MONEY_ENABLED"]:
+            return []
+        sm_positions = [p for p in self.state.open_positions
+                        if p.strategy == "SMART_MONEY" and p.source_wallet]
+        if not sm_positions:
+            return []
+
+        by_wallet: dict[str, list] = {}
+        for p in sm_positions:
+            by_wallet.setdefault(p.source_wallet, []).append(p)
+
+        to_close = []
+        for wallet, positions in by_wallet.items():
+            trades = self.fetch_recent_trades(wallet, 20)
+            sells = [t for t in trades if str(t.get("side", "")).upper() == "SELL"]
+            if not sells:
+                continue
+            for pos in positions:
+                try:
+                    opened_ts = datetime.fromisoformat(pos.opened_at).timestamp()
+                except (ValueError, TypeError):
+                    opened_ts = 0.0
+                for t in sells:
+                    if self.get_token_id(t) != pos.token_id:
+                        continue
+                    try:
+                        sell_ts = float(t.get("timestamp", 0))
+                    except (ValueError, TypeError):
+                        sell_ts = 0.0
+                    if sell_ts <= opened_ts:
+                        continue
+                    price = self.scanner.get_token_price(pos.token_id)
+                    if price is None:
+                        try:
+                            price = float(t.get("price", 0)) or pos.entry_price
+                        except (ValueError, TypeError):
+                            price = pos.entry_price
+                    to_close.append((pos, price, pos.source_name or wallet[:10]))
+                    break
+        return to_close
+
+    def _build_consensus(self, trades_by_wallet: dict) -> dict:
+        """token_id → nº de wallets DISTINTAS con un BUY fresco en ese token.
+        Sirve para exigir confirmación de varias wallets antes de copiar."""
+        consensus: dict[str, set] = {}
+        for address, trades in (trades_by_wallet or {}).items():
+            for t in (trades or []):
+                if str(t.get("side", "")).upper() != "BUY":
+                    continue
+                if not self.is_trade_fresh(t):
+                    continue
+                tid = self.get_token_id(t)
+                if tid:
+                    consensus.setdefault(tid, set()).add(address)
+        return {tid: len(wallets) for tid, wallets in consensus.items()}
 
     def run(self) -> int:
         if not CONFIG["SMART_MONEY_ENABLED"]:
@@ -1507,25 +1678,61 @@ class SmartMoneyMonitor:
         max_copies  = min(CONFIG["SMART_MONEY_MAX_COPIES"], slots)
         log.info(f"[SmartMoney] Monitoreando {len(SMART_WALLETS)} wallets...")
 
+        # Un solo fetch por wallet: se reusa para el consenso y para el loop.
+        trades_by_wallet = {w["address"]: self.fetch_recent_trades(w["address"])
+                            for w in SMART_WALLETS}
+
+        # Consenso: cuántas wallets DISTINTAS compraron (BUY fresco) cada token.
+        consensus = self._build_consensus(trades_by_wallet)
+        min_consensus = max(1, CONFIG["SMART_MONEY_MIN_CONSENSUS"])
+        if min_consensus > 1:
+            confirmados = sum(1 for c in consensus.values() if c >= min_consensus)
+            log.info(f"[SmartMoney] Consenso ≥{min_consensus}: {confirmados} tokens confirmados")
+
         for wallet_info in SMART_WALLETS:
             if copies_made >= max_copies:
                 break
             address = wallet_info["address"]
             name    = wallet_info["name"]
-            trades  = self.fetch_recent_trades(address)
+            trades  = trades_by_wallet.get(address) or []
 
             if not trades:
                 log.info(f"[SmartMoney] {name}: sin trades recientes")
                 continue
-            log.info(f"[SmartMoney] {name}: {len(trades)} trades encontrados")
-            log.info(f"[SmartMoney] {name} sample trade keys: {list(trades[0].keys())}")
-            log.info(f"[SmartMoney] {name} sample trade: side={trades[0].get('side')!r} price={trades[0].get('price')!r} timestamp={trades[0].get('timestamp')!r}")
 
+            # Contadores para un resumen conciso por wallet (el detalle
+            # por-trade va a DEBUG dentro de should_copy).
+            n_sell = n_viejo = n_zona = n_copiadas = 0
             for trade in trades:
+                side = str(trade.get("side", "")).upper()
+                if side == "SELL":
+                    n_sell += 1
+                elif not self.is_trade_fresh(trade):
+                    n_viejo += 1
+                else:
+                    try:
+                        pr = float(trade.get("price", 0))
+                    except (ValueError, TypeError):
+                        pr = 0
+                    if not (0.15 <= pr <= 0.85):
+                        n_zona += 1
+
                 if copies_made >= max_copies:
-                    break
+                    continue
                 if not self.should_copy(trade, name):
                     continue
+                # Filtro de consenso: exigir que N wallets distintas hayan
+                # comprado este mismo token (señal confirmada, no de una sola).
+                tid = self.get_token_id(trade)
+                n_conf = consensus.get(tid, 0) if tid else 0
+                if n_conf < min_consensus:
+                    log.info(
+                        f"[SmartMoney] {name}: saltado por consenso insuficiente "
+                        f"({n_conf} < {min_consensus}) — '{str(trade.get('title',''))[:40]}'"
+                    )
+                    continue
+                if min_consensus > 1:
+                    log.info(f"[SmartMoney] consenso {n_conf}/{min_consensus} confirmado")
                 condition_id = self.get_condition_id(trade)
                 position = self.copy_trade(trade, name)
                 if position:
@@ -1533,8 +1740,14 @@ class SmartMoneyMonitor:
                     self.state.open_positions.append(position)
                     if condition_id:
                         self.state.analyzed_today.add(condition_id)
-                    log.info("[SmartMoney] ✅ Posición de copia abierta")
+                    log.info(f"[SmartMoney] ✅ Copia abierta: '{position.market_question[:40]}'")
                     copies_made += 1
+                    n_copiadas += 1
+
+            log.info(
+                f"[SmartMoney] {name}: {len(trades)} trades → {n_copiadas} copiadas "
+                f"({n_sell} sells, {n_viejo} viejos, {n_zona} fuera de zona)"
+            )
 
         log.info(f"[SmartMoney] Ciclo terminado: {copies_made} copias")
         return copies_made
@@ -1734,6 +1947,7 @@ class ContrarianFadeStrategy:
             bet_size_usd=bet_size,
             reasoning=f"Contrarian fade: Yes cambió {fade_info['yes_change']*100:+.1f}% en 24h",
             confidence="LOW",
+            strategy="CONTRARIAN",
         )
 
         log.info(
@@ -1817,20 +2031,80 @@ class PolymarketAgent:
 
         self.smart_money = SmartMoneyMonitor(self.scanner, self.executor, self.state)
         self.contrarian = ContrarianFadeStrategy(self.scanner, self.executor, self.state)
+        wallets_src = "wallets.json" if os.path.exists(WALLETS_FILE) else "lista por defecto"
+        log.info(f"[SmartMoney] {len(SMART_WALLETS)} wallets cargadas ({wallets_src})")
         self._print_banner()
  
+    def _install_signal_handlers(self):
+        """SIGTERM (systemctl stop/restart) y SIGINT → salida limpia."""
+        import signal
+
+        def _handler(signum, _frame):
+            log.info(f"Señal {signum} recibida — cerrando limpio...")
+            self._stop = True
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                signal.signal(sig, _handler)
+            except (ValueError, OSError):
+                pass  # p.ej. si no estamos en el hilo principal
+
     def run(self):
-        log.info("Agente iniciado. Ctrl+C para detener.")
+        log.info("Agente iniciado. Ctrl+C (o systemctl stop) para detener.")
+        self._stop = False
+        self._install_signal_handlers()
+        fast_min = max(1, CONFIG["SMART_MONEY_INTERVAL_MIN"])
+        scan_min = max(fast_min, CONFIG["SCAN_INTERVAL_MIN"])
+        log.info(f"Loop: tick copytrading cada {fast_min} min | scan completo cada {scan_min} min")
+        last_full_scan = 0.0
         try:
-            while True:
-                self._run_cycle()
-                StatePersistence.save(self.state)
-                log.info(f"Próximo ciclo en {CONFIG['SCAN_INTERVAL_MIN']} min...")
-                time.sleep(CONFIG["SCAN_INTERVAL_MIN"] * 60)
+            while not self._stop:
+                # Un fallo en un ciclo NO debe matar el proceso: se loguea y
+                # se sigue al siguiente tick (operación desatendida 24/7).
+                try:
+                    if time.time() - last_full_scan >= scan_min * 60:
+                        self._run_cycle()
+                        last_full_scan = time.time()
+                    else:
+                        self._fast_tick()
+                except Exception:
+                    log.exception("Error no manejado en el ciclo — continuando")
+
+                try:
+                    StatePersistence.save(self.state)
+                except Exception:
+                    log.exception("Error guardando estado")
+
+                # Dormir en tramos cortos para reaccionar rápido a SIGTERM
+                for _ in range(int(fast_min * 60)):
+                    if self._stop:
+                        break
+                    time.sleep(1)
         except KeyboardInterrupt:
             log.info("Detenido manualmente.")
+        finally:
             StatePersistence.save(self.state)
             self._print_summary()
+
+    def _fast_tick(self):
+        """Tick rápido (gratis): monitoreo de posiciones + copytrading.
+        Corre cada SMART_MONEY_INTERVAL_MIN; el escaneo completo de
+        mercados queda para _run_cycle."""
+        log.info(f"── tick | Bankroll: ${self.state.bankroll:.2f} | "
+                 f"Posiciones: {len(self.state.open_positions)} ──")
+        if not CONFIG["DRY_RUN"] and self.executor.clob is None:
+            log.error("⛔ CLOB no inicializado — tick cancelado.")
+            return
+        self.executor.refresh_live_positions()
+        self._check_daily_reset()
+        self._monitor_positions()
+        if self.state.daily_loss_triggered:
+            log.warning("⛔ Stop diario activo. Sin nuevas entradas.")
+            return
+        try:
+            self.smart_money.run()
+        except Exception as e:
+            log.error(f"Error en Smart Money: {e}")
  
     def _run_cycle(self):
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1866,7 +2140,7 @@ class PolymarketAgent:
         # ── ESTRATEGIA A: Resolución tardía (GRATIS — sin Claude) ────────────
         # No usa analyzed_today: mercados pueden permanecer sin resolver varios días,
         # y necesitamos poder reentrar si la posición anterior ya se cerró.
-        late_markets = self.scanner.find_late_resolution()
+        late_markets = self.scanner.find_late_resolution() if CONFIG["LATE_RESOLUTION_ENABLED"] else []
         for m in late_markets[:3]:
             if slots <= 0:
                 break
@@ -1896,18 +2170,26 @@ class PolymarketAgent:
                 bet_size_usd=bet_size,
                 reasoning=f"Late resolution: mercado ya venció, {best['name']} a {best['price']:.3f}",
                 confidence="HIGH",
+                strategy="LATE_RESOLUTION",
             )
             position = self.executor.buy(opp)
             if position:
-                self.state.bankroll -= bet_size
+                # Descontar el gasto REAL: buy() sube la apuesta al mínimo
+                # del exchange ($5), que puede ser mayor que bet_size.
+                self.state.bankroll -= position.size_usd
                 self.state.open_positions.append(position)
                 slots -= 1
                 log.info("  Posición de resolución tardía abierta")
 
-        # ── ESTRATEGIA B: Arbitraje correlacionado (GRATIS — sin Claude) ─────
+        # Mercados activos: los usan la Estrategia B, Contrarian y la C (IA).
+        # Se descargan siempre porque las estrategias de abajo dependen de ellos.
         all_markets_raw = self.scanner.get_active_markets()
-        all_markets_filtered = self.scanner.filter_markets(all_markets_raw)
-        arb_opps = self.scanner.find_correlated_arbitrage(all_markets_filtered)
+
+        # ── ESTRATEGIA B: Arbitraje correlacionado (GRATIS — sin Claude) ─────
+        arb_opps = []
+        if CONFIG["CORRELATED_ARB_ENABLED"]:
+            all_markets_filtered = self.scanner.filter_markets(all_markets_raw)
+            arb_opps = self.scanner.find_correlated_arbitrage(all_markets_filtered)
         for arb in arb_opps[:2]:
             if slots <= 0:
                 break
@@ -1932,10 +2214,12 @@ class PolymarketAgent:
                 bet_size_usd=bet_size,
                 reasoning=arb["reasoning"],
                 confidence="HIGH",
+                strategy="ARB",
             )
             position = self.executor.buy(opp)
             if position:
-                self.state.bankroll -= bet_size
+                # Gasto real (buy() aplica el mínimo de $5 del exchange)
+                self.state.bankroll -= position.size_usd
                 self.state.open_positions.append(position)
                 slots -= 1
                 log.info("  Posición de arbitraje abierta")
@@ -2043,39 +2327,66 @@ class PolymarketAgent:
             f"({'+'if self.state.total_pnl>=0 else ''}{self.state.total_pnl_pct:.1f}% total) ═══"
         )
  
+    def _close_position(self, pos: Position, current_price: float) -> float:
+        """Cierra una posición con toda la contabilidad: venta, bankroll,
+        PnL por wallet copiada y stop diario. Devuelve el PnL. El caller
+        es responsable de sacarla de open_positions."""
+        received = self.executor.sell(pos, current_price)
+        pnl = self.bankroll_mgr.update(self.state, received, pos)
+        pos.status = "CLOSED_PROFIT" if pnl >= 0 else "CLOSED_LOSS"
+        self.state.closed_positions.append(pos)
+
+        if pos.strategy == "SMART_MONEY":
+            key = pos.source_name or pos.source_wallet[:10] or "?"
+            self.state.wallet_pnl[key] = round(self.state.wallet_pnl.get(key, 0.0) + pnl, 2)
+            log.info(f"[PnL] SMART_MONEY/{key}: {pnl:+.2f} "
+                     f"(acumulado wallet: {self.state.wallet_pnl[key]:+.2f})")
+
+        if self.state.daily_pnl <= -CONFIG["MAX_DAILY_LOSS"]:
+            log.warning(f"⛔ Stop diario: ${self.state.daily_pnl:.2f}")
+            self.state.daily_loss_triggered = True
+        return pnl
+
     def _monitor_positions(self):
         """Evalúa todas las posiciones abiertas y cierra las que corresponda."""
+        # Copy-exits primero: si la wallet copiada ya salió, salir con ella
+        try:
+            for pos, price, src in self.smart_money.check_exits():
+                if pos not in self.state.open_positions:
+                    continue
+                log.info(f"[SmartMoney] 🚪 COPY-EXIT: {src} vendió "
+                         f"'{pos.market_question[:40]}' → cerrando copia")
+                self._close_position(pos, price)
+                self.state.open_positions.remove(pos)
+        except Exception as e:
+            log.error(f"Error en copy-exits: {e}")
+
         if not self.state.open_positions:
             return
- 
+
         log.info(f"Monitoreando {len(self.state.open_positions)} posiciones abiertas...")
         still_open = []
- 
-        for pos in self.state.open_positions:
+        positions = list(self.state.open_positions)
+
+        for i, pos in enumerate(positions):
             decision = self.monitor.evaluate(pos)
- 
+
             log.info(
                 f"  [{pos.id}] '{pos.outcome}' @ {pos.entry_price:.3f} → "
                 f"{decision.current_price:.3f} | "
                 f"PnL: {decision.unrealized_pnl_pct:+.1f}% | "
                 f"{'CERRAR: '+decision.reason if decision.should_close else 'Mantener'}"
             )
- 
+
             if decision.should_close:
-                received = self.executor.sell(pos, decision.current_price)
-                pnl = self.bankroll_mgr.update(self.state, received, pos)
- 
-                pos.status = "CLOSED_PROFIT" if pnl >= 0 else "CLOSED_LOSS"
-                self.state.closed_positions.append(pos)
- 
-                # Verificar stop diario
-                if self.state.daily_pnl <= -CONFIG["MAX_DAILY_LOSS"]:
-                    log.warning(f"⛔ Stop diario: ${self.state.daily_pnl:.2f}")
-                    self.state.daily_loss_triggered = True
+                self._close_position(pos, decision.current_price)
+                if self.state.daily_loss_triggered:
+                    # No perder las posiciones aún no evaluadas
+                    still_open.extend(positions[i+1:])
                     break
             else:
                 still_open.append(pos)
- 
+
         self.state.open_positions = still_open
  
     def _check_daily_reset(self):
@@ -2140,20 +2451,37 @@ def run_keep_alive():
         return {"status": "alive"}, 200
 
     port = int(os.getenv("PORT", 8080))
+    host = CONFIG["KEEPALIVE_HOST"]   # 127.0.0.1 por default: no exponer
     thread = threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=port, use_reloader=False),
+        target=lambda: app.run(host=host, port=port, use_reloader=False),
         daemon=True,
     )
     thread.start()
-    log.info(f"Keep-alive server corriendo en puerto {port}")
+    log.info(f"Keep-alive server corriendo en {host}:{port}")
 
 
 # ═══════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ═══════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    if not CONFIG["ANTHROPIC_API_KEY"]:
-        print("ERROR: Falta ANTHROPIC_API_KEY en el .env")
+    ai_needed = CONFIG["MAX_MARKETS_PER_RUN"] > 0 or CONFIG["CLOSE_IF_EDGE_GONE"]
+    if ai_needed and not CONFIG["ANTHROPIC_API_KEY"]:
+        print("ERROR: Falta ANTHROPIC_API_KEY en el .env "
+              "(o usa MAX_MARKETS_PER_RUN=0 para modo gratuito sin IA)")
         sys.exit(1)
-    run_keep_alive()
+    if CONFIG["FREE_ONLY"]:
+        log.info("💸 FREE_ONLY activo — cero llamadas de pago (solo estrategias gratis)")
+    elif not CONFIG["ANTHROPIC_API_KEY"]:
+        log.info("💸 Modo gratuito — sin análisis IA, solo estrategias sin costo")
+    activas = [n for n, on in (
+        ("SmartMoney", CONFIG["SMART_MONEY_ENABLED"]),
+        ("ResoluciónTardía", CONFIG["LATE_RESOLUTION_ENABLED"]),
+        ("Arbitraje", CONFIG["CORRELATED_ARB_ENABLED"]),
+        ("Contrarian", CONFIG["CONTRARIAN_ENABLED"]),
+        ("EdgeIA", CONFIG["MAX_MARKETS_PER_RUN"] > 0),
+    ) if on]
+    log.info(f"Estrategias activas: {', '.join(activas) if activas else 'NINGUNA'}")
+    # Bajo systemd no hace falta el keep-alive (evita choque de puertos)
+    if CONFIG["KEEPALIVE_ENABLED"]:
+        run_keep_alive()
     PolymarketAgent().run()
