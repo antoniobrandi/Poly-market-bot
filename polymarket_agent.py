@@ -72,9 +72,13 @@ CONFIG = {
  
     # ── Take Profit / Stop Loss ─────────────────────────────
     # Cerrar posición si el precio sube X% desde entrada (ganancia)
-    "TAKE_PROFIT_PCT":      float(os.getenv("TAKE_PROFIT_PCT", "0.30")),  # +30% sobre entrada
+    "TAKE_PROFIT_PCT":      float(os.getenv("TAKE_PROFIT_PCT", "0.40")),  # +40% sobre entrada
     # Cerrar si el precio baja X% desde entrada (pérdida)
-    "STOP_LOSS_PCT":        float(os.getenv("STOP_LOSS_PCT", "0.40")),    # -40% sobre entrada
+    # TP/SL asimétricos a favor: con +40/−30 basta 42.9% de aciertos para
+    # empatar; con los +30/−40 anteriores hacía falta 57.1% (la simulación
+    # dio 54.5%, por eso cerró en negativo pese a ganar más veces de las
+    # que perdió). Punto de equilibrio: w·TP = (1−w)·SL.
+    "STOP_LOSS_PCT":        float(os.getenv("STOP_LOSS_PCT", "0.30")),    # -30% sobre entrada
     # Cerrar si quedan menos de N días para resolución (capturar liquidez)
     "CLOSE_DAYS_LEFT":      int(os.getenv("CLOSE_DAYS_LEFT", "3")),
     # Cerrar si el edge ya desapareció (mercado corrigió)
@@ -123,6 +127,12 @@ CONFIG = {
     # Consenso: nº de wallets distintas que deben haber comprado el mismo
     # token para copiarlo. 1 = comportamiento clásico; 2+ = exigir confirmación.
     "SMART_MONEY_MIN_CONSENSUS": int(os.getenv("SMART_MONEY_MIN_CONSENSUS", "1")),
+    # Plazo máximo de resolución. Evita congelar capital meses: con banca
+    # chica, dos posiciones a 1+ año dejan al bot sin dinero disponible.
+    "SMART_MONEY_MAX_DAYS": int(os.getenv("SMART_MONEY_MAX_DAYS", "60")),
+    # Si no se puede averiguar la fecha de resolución, ¿copiar igual?
+    # Default: sí (no bloquear todo por un detalle de la API de gamma).
+    "SMART_MONEY_SKIP_UNKNOWN_END": os.getenv("SMART_MONEY_SKIP_UNKNOWN_END", "false").lower() == "true",
 
     # ── Contrarian Fade ─────────────────────────────────
     # Tesis frágil (un movimiento fuerte puede ser noticia real, no ruido).
@@ -319,7 +329,12 @@ CLOB_API  = "https://clob.polymarket.com"
 CLOB_PRICES_HISTORY = "https://clob.polymarket.com/prices-history"
  
 class PolymarketScanner:
- 
+
+    def __init__(self):
+        # conditionId → fecha de resolución ISO (o None si no se pudo).
+        # Evita repetir la misma consulta a gamma en cada tick.
+        self._end_date_cache: dict[str, Optional[str]] = {}
+
     def get_active_markets(self, limit=300) -> list[Market]:
         # Intentar con diferentes combinaciones de parámetros
         param_sets = [
@@ -727,6 +742,50 @@ class PolymarketScanner:
         except Exception:
             pass
         return None
+
+    def get_market_end_date(self, condition_id: str) -> Optional[str]:
+        """
+        Fecha de resolución (ISO) de un mercado, buscada por conditionId.
+
+        Hace falta porque el endpoint /trades de la data-api NO devuelve
+        endDate: sin esto no se puede saber si un mercado copiado resuelve
+        en días o en años. Cachea en memoria porque la misma wallet repite
+        los mismos mercados en cada tick.
+
+        Devuelve None si no se pudo averiguar (nunca lanza).
+        """
+        if not condition_id:
+            return None
+        if condition_id in self._end_date_cache:
+            return self._end_date_cache[condition_id]
+
+        end_date = None
+        # Dos formas de preguntarle a gamma; nos quedamos con la primera
+        # que responda con un endDate utilizable.
+        intentos = (
+            (f"{GAMMA_API}/markets", {"condition_ids": condition_id}),
+            (f"{GAMMA_API}/markets/{condition_id}", None),
+        )
+        for url, params in intentos:
+            try:
+                resp = requests.get(url, params=params, timeout=10,
+                                    headers={"Accept": "application/json"})
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
+                # La respuesta puede ser un dict o una lista de mercados
+                if isinstance(data, list):
+                    data = data[0] if data else {}
+                if isinstance(data, dict):
+                    val = data.get("endDate") or data.get("end_date")
+                    if val:
+                        end_date = str(val)
+                        break
+            except Exception:
+                continue
+
+        self._end_date_cache[condition_id] = end_date
+        return end_date
  
  
 # ═══════════════════════════════════════════════════════════
@@ -1495,23 +1554,53 @@ class SmartMoneyMonitor:
         if token_id_check and any(p.token_id == token_id_check for p in self.state.open_positions):
             log.debug(f"[SmartMoney] {wallet_name}: token_id ya en posición local — saltando")
             return False
-        end_date_raw = trade.get("endDate") or trade.get("end_date")
-        if end_date_raw:
-            try:
-                from datetime import timezone
-                end_dt = datetime.fromisoformat(str(end_date_raw).replace("Z", "+00:00"))
-                if end_dt.tzinfo is None:
-                    end_dt = end_dt.replace(tzinfo=timezone.utc)
-                if end_dt <= datetime.now(timezone.utc):
-                    log.debug(f"[SmartMoney] {wallet_name}: mercado ya vencido (end_date={end_date_raw})")
-                    return False
-            except (ValueError, TypeError):
-                pass
         # Guard por question normalizada: detecta duplicados aunque condition_id difiera entre APIs
         question = str(trade.get("title", trade.get("question", "")))
         norm_q = question.lower().strip()
         if norm_q and any(p.market_question.lower().strip() == norm_q for p in self.state.open_positions):
             log.debug(f"[SmartMoney] {wallet_name}: pregunta ya en posición abierta — '{question[:60]}'")
+            return False
+
+        # ── Plazo de resolución (consulta HTTP: va al final, después de los
+        # filtros baratos, para no gastar requests en trades ya descartados).
+        # El endpoint /trades NO trae endDate, así que hay que preguntarle a
+        # gamma por conditionId.
+        if not self._check_plazo(condition_id, wallet_name, question):
+            return False
+        return True
+
+    def _check_plazo(self, condition_id: str, wallet_name: str, question: str) -> bool:
+        """False si el mercado ya venció o resuelve demasiado lejos."""
+        from datetime import timezone, timedelta
+        end_iso = self.scanner.get_market_end_date(condition_id)
+
+        if not end_iso:
+            if CONFIG["SMART_MONEY_SKIP_UNKNOWN_END"]:
+                log.info(f"[SmartMoney] {wallet_name}: sin fecha de resolución — saltando (modo estricto)")
+                return False
+            log.debug(f"[SmartMoney] {wallet_name}: sin fecha de resolución, copiando igual")
+            return True
+
+        try:
+            end_dt = datetime.fromisoformat(str(end_iso).replace("Z", "+00:00"))
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            log.debug(f"[SmartMoney] {wallet_name}: fecha ilegible ({end_iso!r})")
+            return not CONFIG["SMART_MONEY_SKIP_UNKNOWN_END"]
+
+        ahora = datetime.now(timezone.utc)
+        if end_dt <= ahora:
+            log.info(f"[SmartMoney] {wallet_name}: mercado ya vencido — '{question[:45]}'")
+            return False
+
+        dias = (end_dt - ahora).days
+        if dias > CONFIG["SMART_MONEY_MAX_DAYS"]:
+            log.info(
+                f"[SmartMoney] {wallet_name}: resuelve en {dias} días "
+                f"(máx {CONFIG['SMART_MONEY_MAX_DAYS']}) — capital quedaría "
+                f"congelado: '{question[:45]}'"
+            )
             return False
         return True
 
@@ -1576,7 +1665,11 @@ class SmartMoneyMonitor:
             category="SMART_MONEY",
             volume=0,
             liquidity=0,
-            end_date=str(trade.get("endDate", "")),
+            # El trade no trae endDate: se toma de gamma (cacheado, ya se
+            # consultó en should_copy). Sin esto la posición quedaba con
+            # end_date="" y la regla de "pocos días restantes" del
+            # PositionMonitor nunca se aplicaba a las copias.
+            end_date=self.scanner.get_market_end_date(condition_id) or "",
             outcomes=[{"name": str(trade.get("outcome", "Yes")),
                        "token_id": token_id, "price": current_price}],
             url="",

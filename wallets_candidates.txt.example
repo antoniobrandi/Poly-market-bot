@@ -14,3 +14,22 @@
 # Ejemplo (borra estas y pon las tuyas):
 0x30d1c420d1abde9442d6762dd6f6d5f92df04525  randomWalkingS
 0xffb0b9b292e406fd250854a35a0c9bd5612aFa37  BloodyMummer
+
+# ── Descartadas tras la prueba del 27-jul al 14-ago (2.5 semanas) ──
+# Resultado global: -$1.35 sobre $55 movidos, 6 ganadoras / 5 perdedoras.
+#
+# randomWalkingS  0x30d1c420d1abde9442d6762dd6f6d5f92df04525
+#   PnL -$3.36. Mucha actividad, pero metió las 3 posiciones de plazo
+#   largo (incluida "U.S. invade Iran before 2027": capital congelado
+#   más de un año). El filtro SMART_MONEY_MAX_DAYS ataca justo eso, así
+#   que vale la pena reconsiderarla más adelante.
+#
+# ewelmealt       0x07921379f7b31ef93da634b688b2fe36897db778
+#   0 copias en 2.5 semanas: sus trades siempre llegaban más viejos que
+#   SMART_MONEY_MAX_HOURS. Wallet prácticamente inactiva.
+#
+# CKW             0x92672c80d36dcd08172aa1e51dface0f20b70f9a
+#   0 copias. Scalper de deportes en vivo (UFC/MLB): las cuotas se mueven
+#   en segundos, así que al copiar con 15 min de retraso el precio ya se
+#   fue (se vieron slippages de 59-63%). Mal perfil para copytrading.
+
