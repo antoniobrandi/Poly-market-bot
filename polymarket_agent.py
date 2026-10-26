@@ -43,7 +43,13 @@ except ImportError:
     logging.warning("py-clob-client-v2 no instalado. Corriendo en modo DRY RUN.")
  
 load_dotenv()
- 
+
+# Carpeta donde viven los datos que DEBEN sobrevivir reinicios
+# (agent_state.json y el log). En Railway hay que montar un Volume y
+# poner DATA_DIR=/data, porque el disco del contenedor se borra en cada
+# redeploy. En local/systemd el default "." usa la carpeta del proyecto.
+_DATA_DIR = os.getenv("DATA_DIR", ".")
+
 # ═══════════════════════════════════════════════════════════
 #  CONFIGURACIÓN
 # ═══════════════════════════════════════════════════════════
@@ -99,8 +105,11 @@ CONFIG = {
     "PRE_FILTER_BATCH_SIZE": int(os.getenv("PRE_FILTER_BATCH_SIZE", "40")),  # max mercados al pre-filtro
     "PRE_FILTER_TOP_N":      int(os.getenv("PRE_FILTER_TOP_N", "5")),        # cuántos pasan a análisis profundo
     "DRY_RUN":              os.getenv("DRY_RUN", "true").lower() == "true",
-    "STATE_FILE":           "agent_state.json",
-    "LOG_FILE":             "polymarket_agent.log",
+    # Carpeta de datos persistentes. En Railway debe apuntar al Volume
+    # montado (DATA_DIR=/data); si no, el estado se borra en cada redeploy.
+    "DATA_DIR":             _DATA_DIR,
+    "STATE_FILE":           os.getenv("STATE_FILE") or os.path.join(_DATA_DIR, "agent_state.json"),
+    "LOG_FILE":             os.getenv("LOG_FILE") or os.path.join(_DATA_DIR, "polymarket_agent.log"),
 
     # ── Smart Money Following ──────────────────────────────────────────
     "SMART_MONEY_ENABLED":      os.getenv("SMART_MONEY_ENABLED", "true").lower() == "true",
@@ -191,13 +200,24 @@ POLYMARKET_DATA_API = "https://data-api.polymarket.com"
 # ═══════════════════════════════════════════════════════════
 #  LOGGING
 # ═══════════════════════════════════════════════════════════
+def _log_handlers():
+    """stdout siempre (es lo que lee Railway/journalctl). El archivo es
+    opcional: si la carpeta no existe o es de solo lectura, seguimos sin él
+    en vez de tronar al arrancar."""
+    handlers = [logging.StreamHandler(sys.stdout)]
+    try:
+        d = os.path.dirname(CONFIG["LOG_FILE"])
+        if d:
+            os.makedirs(d, exist_ok=True)
+        handlers.insert(0, logging.FileHandler(CONFIG["LOG_FILE"]))
+    except Exception as e:
+        print(f"[warn] sin log a archivo ({e}); solo stdout")
+    return handlers
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(CONFIG["LOG_FILE"]),
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=_log_handlers(),
 )
 log = logging.getLogger(__name__)
  
@@ -1314,6 +1334,9 @@ class StatePersistence:
  
     @staticmethod
     def save(state: AgentState):
+        d = os.path.dirname(CONFIG["STATE_FILE"])
+        if d:
+            os.makedirs(d, exist_ok=True)
         data = {
             "bankroll": state.bankroll,
             "initial_bankroll": state.initial_bankroll,
@@ -1329,7 +1352,6 @@ class StatePersistence:
         }
         with open(CONFIG["STATE_FILE"], "w") as f:
             json.dump(data, f, indent=2)
- 
     @staticmethod
     def load() -> Optional[AgentState]:
         if not os.path.exists(CONFIG["STATE_FILE"]):
@@ -2473,6 +2495,17 @@ if __name__ == "__main__":
         log.info("💸 FREE_ONLY activo — cero llamadas de pago (solo estrategias gratis)")
     elif not CONFIG["ANTHROPIC_API_KEY"]:
         log.info("💸 Modo gratuito — sin análisis IA, solo estrategias sin costo")
+
+    # Aviso crítico: en Railway el disco se borra en cada redeploy. Sin un
+    # Volume montado y DATA_DIR apuntando a él, el bot pierde sus posiciones
+    # abiertas y reinicia el bankroll en cada deploy.
+    log.info(f"📁 Estado persistente en: {os.path.abspath(CONFIG['STATE_FILE'])}")
+    if os.getenv("RAILWAY_ENVIRONMENT") and CONFIG["DATA_DIR"] in (".", "", "./"):
+        log.warning(
+            "⚠️  Corriendo en Railway SIN volumen persistente (DATA_DIR='.'). "
+            "El estado se BORRARÁ en cada redeploy: posiciones abiertas huérfanas "
+            "y bankroll reiniciado. Monta un Volume y pon DATA_DIR=/data."
+        )
     activas = [n for n, on in (
         ("SmartMoney", CONFIG["SMART_MONEY_ENABLED"]),
         ("ResoluciónTardía", CONFIG["LATE_RESOLUTION_ENABLED"]),
