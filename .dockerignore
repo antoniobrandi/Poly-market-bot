@@ -1,0 +1,25 @@
+# Node (herencia de Replit): no se usa para correr el bot
+node_modules
+.pnpm-store
+pnpm-lock.yaml
+package.json
+package-lock.json
+tsconfig*.json
+lib
+artifacts
+attached_assets
+
+# Python
+__pycache__
+*.pyc
+venv
+.venv
+
+# Secretos y estado local — NUNCA deben ir en la imagen
+.env
+agent_state.json
+*.log
+wallets_candidates.txt
+
+.git
+.gitignore
