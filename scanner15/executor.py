@@ -191,7 +191,15 @@ class Gamma:
         r = self.s.get(f"{GAMMA}/markets", params={"slug": slug}, timeout=8)
         r.raise_for_status()
         d = r.json()
-        return d[0] if isinstance(d, list) and d else None
+        if isinstance(d, list) and d:
+            return d[0]
+        # respaldo: el mismo camino que usa scanner.py (/events?slug=…)
+        r = self.s.get(f"{GAMMA}/events", params={"slug": slug}, timeout=8)
+        r.raise_for_status()
+        ev = r.json()
+        if isinstance(ev, list) and ev and ev[0].get("markets"):
+            return ev[0]["markets"][0]
+        return None
 
 
 def _jlist(v) -> list:

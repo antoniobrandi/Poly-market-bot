@@ -357,3 +357,22 @@ def test_many_signals_same_window_capped_by_daily_limit(tmp_path):
     recs = ex.handle_signals([sig(clk, k) for k in coins])
     assert [r["moneda"] for r in recs] == ["BTC", "ETH", "SOL", "XRP"]
     assert ex.open_risk() <= E.MAX_DAILY_LOSS
+
+
+def test_gamma_falls_back_to_events(monkeypatch):
+    """Si /markets?slug no trae nada, usa /events?slug (como scanner.py)."""
+    class R:
+        def __init__(self, d): self.d = d
+        def raise_for_status(self): pass
+        def json(self): return self.d
+    calls = []
+
+    def fake_get(url, params=None, timeout=None):
+        calls.append(url.rsplit("/", 1)[1])
+        if url.endswith("/markets"):
+            return R([])
+        return R([{"markets": [{"slug": params["slug"], "closed": False}]}])
+    g = E.Gamma()
+    monkeypatch.setattr(g.s, "get", fake_get)
+    m = g.market("btc-updown-15m-1794731400")
+    assert m["slug"] == "btc-updown-15m-1794731400" and calls == ["markets", "events"]
