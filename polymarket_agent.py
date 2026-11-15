@@ -1264,6 +1264,7 @@ class OrderExecutor:
         # Exchange mínimo $5 USDC — ajustar si Kelly da menos
         bet_size = max(opp.bet_size_usd, 5.0)
         shares = bet_size / opp.market_price
+        entry_price = opp.market_price
 
         if CONFIG["DRY_RUN"]:
             log.info(
@@ -1289,18 +1290,51 @@ class OrderExecutor:
                     f"({str(e)[:80]})"
                 )
                 return None
+            # OrderArgs.size son SHARES (no USD): en un BUY el exchange
+            # cobra size × price. Convertimos el monto en USD a shares
+            # usando el mismo precio límite que mandamos en la orden.
+            limit_price = round(opp.market_price + 0.001, 3)
+            order_shares = round(bet_size / limit_price, 2)
+
+            # El mínimo del exchange (min_order_size) está en shares.
+            try:
+                book = self.clob.get_order_book(opp.token_id)
+                if isinstance(book, dict):
+                    min_size = book.get("min_order_size")
+                else:
+                    min_size = getattr(book, "min_order_size", None)
+                min_size = float(min_size) if min_size not in (None, "") else 0.0
+            except Exception as e:
+                log.warning(f"No se pudo leer min_order_size de '{opp.outcome_name}': {str(e)[:80]}")
+                min_size = 0.0
+            if order_shares < min_size:
+                log.info(
+                    f"BUY saltado: '{opp.outcome_name}' {order_shares:.2f} shares "
+                    f"< mínimo del mercado {min_size:g} shares"
+                )
+                return None
+
             try:
                 order = OrderArgs(
                     token_id=opp.token_id,
-                    price=round(opp.market_price + 0.001, 3),
-                    size=bet_size,
+                    price=limit_price,
+                    size=order_shares,
                     side="BUY",
                 )
                 self.clob.create_and_post_order(order)
             except Exception as e:
                 log.error(f"Error ejecutando BUY: {e}")
                 return None
- 
+
+            # Registrar exactamente lo que se envió al exchange
+            shares = order_shares
+            bet_size = round(order_shares * limit_price, 4)
+            entry_price = limit_price
+            log.info(
+                f"🟢 BUY '{opp.outcome_name}' @ {limit_price:.3f} "
+                f"| {order_shares:.2f} shares ≈ ${bet_size:.2f}"
+            )
+
         return Position(
             id=str(uuid.uuid4())[:8],
             market_condition_id=opp.market.condition_id,
@@ -1309,7 +1343,7 @@ class OrderExecutor:
             token_id=opp.token_id,
             size_usd=bet_size,
             shares=shares,
-            entry_price=opp.market_price,
+            entry_price=entry_price,
             ai_probability=opp.ai_probability,
             end_date=opp.market.end_date,
             opened_at=datetime.now().isoformat(),
