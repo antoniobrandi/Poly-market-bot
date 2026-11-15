@@ -388,3 +388,53 @@ def test_gamma_falls_back_to_events(monkeypatch):
     monkeypatch.setattr(g.s, "get", fake_get)
     m = g.market("btc-updown-15m-1794731400")
     assert m["slug"] == "btc-updown-15m-1794731400" and calls == ["markets", "events"]
+
+
+# ── 9. Reintentos en paralelo (caso real de las 04:15) ─────
+def _book_by_coin(asks):
+    def get_order_book(token):
+        coin = token.split("-", 1)[0]
+        return {"asks": [{"price": str(asks[coin]), "size": "100"}], "bids": [],
+                "tick_size": "0.01", "min_order_size": "5", "neg_risk": False}
+    return get_order_book
+
+
+def test_unfilled_signals_do_not_delay_the_rest(tmp_path):
+    """BTC y ETH sin nada al tope; DOGE sí. DOGE debe comprarse al instante,
+    no 20 s después esperando a que BTC y ETH agoten sus reintentos."""
+    ex, clk, g, c = make(tmp_path)                       # DRY_RUN
+    c.get_order_book = _book_by_coin({"btc": 0.61, "eth": 0.58, "doge": 0.45})
+    t0 = clk.t
+    recs = ex.handle_signals([sig(clk, "btc", price=0.53), sig(clk, "eth", price=0.52),
+                              sig(clk, "doge", price=0.52)], wait=False)
+    doge = [r for r in recs if r["moneda"] == "DOGE"][0]
+    assert doge["estado"] == "LLENADA" and clk.t == t0     # sin esperar a nadie
+    assert {r["moneda"]: r["estado"] for r in recs if r["moneda"] != "DOGE"} == \
+        {"BTC": "REINTENTANDO", "ETH": "REINTENTANDO"}
+    for _ in range(12):                                    # el bucle de --follow
+        clk.t += 1
+        ex.retry_pending()
+    assert {r["moneda"]: r["estado"] for r in recs} == \
+        {"BTC": "SIN_LLENAR", "ETH": "SIN_LLENAR", "DOGE": "LLENADA"}
+    assert ex._retries == []
+
+
+def test_retry_fills_when_ask_comes_down(tmp_path):
+    ex, clk, g, c = make(tmp_path)
+    asks = {"btc": 0.60}
+    c.get_order_book = _book_by_coin(asks)
+    [rec] = ex.handle_signals([sig(clk, "btc", price=0.53)], wait=False)
+    assert rec["estado"] == "REINTENTANDO"
+    clk.t += 1; ex.retry_pending()
+    asks["btc"] = 0.52                                     # baja el ask
+    clk.t += 1; ex.retry_pending()
+    assert rec["estado"] == "LLENADA" and float(rec["precio_llenado"]) == pytest.approx(0.52)
+
+
+def test_interrupted_purchase_is_flagged_on_restart(tmp_path):
+    ex, clk, g, c = make(tmp_path, best_ask=0.60)
+    ex.handle_signals([sig(clk, price=0.53)], wait=False)  # queda REINTENTANDO y "se corta"
+    ex2 = E.Executor(clob=c, gamma=g, base_dir=str(tmp_path), now=clk.now, sleep=clk.sleep)
+    [o] = ex2.state["orders"]
+    assert o["estado"] == "INTERRUMPIDA" and o["resultado"] == "—"
+    assert ex2.handle_signals([sig(clk, price=0.53)]) == []   # el mercado sigue usado

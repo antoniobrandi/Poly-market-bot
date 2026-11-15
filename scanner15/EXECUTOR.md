@@ -40,7 +40,7 @@ adivina mal, fuérzalas: `--col side=senal --col price=ask --col edge=edge_neto`
 | $1 por señal | Compra **por monto**: exactamente $1, sean las acciones que sean (a 45¢ ≈ 2.2 acc; a 60¢ ≈ 1.7) |
 | Igual que el papel | Cada fila nueva de `senales.csv` es una orden, al instante y en el orden en que llegó. Una sola por mercado (moneda + ventana), como `paper.has(slug)`. Si varias monedas marcan señal en la misma ventana, entra en todas (mientras no pase el límite diario). Una vez enviada, ese mercado queda usado aunque no se llene |
 | Nunca más caro que el ask | Precio tope = ask de la señal (redondeado hacia abajo al tick). Es una orden FAK: compra lo que haya a ese precio o mejor y nunca queda viva en el libro. Así compra $1 la web de Polymarket |
-| 10 s | Si no hay nada a ese precio, reintenta cada segundo durante 10 s. Si no llena, queda SIN_LLENAR y el mercado no se vuelve a intentar |
+| 10 s | Si no hay nada a ese precio, reintenta cada segundo durante 10 s. Si no llena, queda SIN_LLENAR y el mercado no se vuelve a intentar. Los reintentos van **en paralelo**: una señal que no llena no hace esperar a las demás |
 | Pérdida diaria $5 | Cuenta lo **cerrado** del día. Al llegar a −$5 no abre más hasta mañana. Lo abierto no frena: hasta 7 órdenes por ventana, como el papel. Peor día posible: ≈ −$5 + una ventana entera perdida |
 | Archivo `STOP` | `touch STOP` → no opera, y corta los reintentos al instante. `rm STOP` para reanudar |
 | `ordenes.csv` | precio de la señal, precio llenado, costo, comisión estimada, resultado, pago y P&L |

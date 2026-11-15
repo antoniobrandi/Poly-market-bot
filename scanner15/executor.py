@@ -259,6 +259,12 @@ class Executor:
         self.gamma = gamma or Gamma()
         self._clob = clob
         self.state = self._load_state()
+        self._retries: list[dict] = []   # señales sin llenar que se reintentan en paralelo
+        for o in self.state["orders"]:
+            if o.get("estado") in ("ENVIANDO", "REINTENTANDO"):
+                o.update(estado="INTERRUMPIDA", resultado="—", pnl_usd=0)
+                log.warning(f"⚠️  {o['slug']}: el ejecutor se cortó mientras compraba — "
+                            f"revisa en Polymarket si se llenó")
 
     # ── conexión ─────────────────────────────────────────────
     @property
@@ -328,9 +334,12 @@ class Executor:
         return None
 
     # ── entrada principal ────────────────────────────────────
-    def handle_signals(self, signals: list[Signal]) -> list[dict]:
+    def handle_signals(self, signals: list[Signal], wait: bool = True) -> list[dict]:
         """Igual que el papel del scanner: cada señal válida es una orden, en el
-        orden en que llegó, y solo una por mercado (moneda + ventana)."""
+        orden en que llegó, y solo una por mercado (moneda + ventana).
+        El primer intento de TODAS sale al instante; las que no llenan se
+        reintentan en paralelo, cada una con sus propios 10 s. Con wait=False
+        (modo --follow) los reintentos avanzan con retry_pending()."""
         now = self.now()
         done = []
         for s in sorted(signals, key=lambda x: x.ts):
@@ -344,6 +353,9 @@ class Executor:
             rec = self.place(s)
             if rec:
                 done.append(rec)
+        while wait and self._retries:
+            self.sleep(self.poll_s)
+            self.retry_pending()
         return done
 
     def _reject_reason(self, s: Signal, now: float) -> Optional[str]:
@@ -414,15 +426,42 @@ class Executor:
 
         log.info(f"{'🧪' if not self.live else '💸'} [{self.mode}] BUY {s.coin.upper()} {s.side} "
                  f"${USD_PER_SIGNAL:.2f} tope {limit*100:.1f}¢ (≈{shares:.2f} acc) | {s.slug}")
+        job = {"rec": rec, "token": token, "limit": limit, "tick": tick,
+               "neg_risk": neg_risk, "t0": self.now(), "tries": 0}
+        if self._attempt(job) == "nofill":
+            rec["estado"] = "REINTENTANDO"
+            self._retries.append(job)
+            self._save()
+        return rec
+
+    def retry_pending(self) -> None:
+        """Un reintento para cada señal que aún no llena; cierra las que pasan 10 s."""
+        for job in list(self._retries):
+            if self.now() - job["t0"] >= self.fill_timeout or os.path.exists(self.stop_path):
+                job["rec"]["estado"] = "SIN_LLENAR"
+                why = "STOP" if os.path.exists(self.stop_path) else f"{self.fill_timeout:g}s"
+                log.info(f"   ⌛ {job['rec']['moneda']} {job['rec']['lado']}: {job['tries']} "
+                         f"intento(s), {why} sin nada a ≤{job['limit']*100:.1f}¢ → no compra")
+                self._retries.remove(job)
+                self._finalize(job["rec"])
+            elif self._attempt(job) != "nofill":
+                self._retries.remove(job)
+
+    def _attempt(self, job: dict) -> str:
+        """Un intento. Devuelve 'filled', 'rejected' o 'nofill'. Cierra el registro si no es nofill."""
+        rec = job["rec"]
+        job["tries"] += 1
         try:
-            if self.live:
-                self._execute_live(rec, token, limit, tick, neg_risk)
-            else:
-                self._execute_dry(rec, token, limit)
+            r = (self._try_live if self.live else self._try_dry)(job)
         except Exception as e:
             rec["estado"] = "ERROR"
-            log.error(f"   ❌ Error con la orden: {e}")
+            log.error(f"   ❌ Error con la orden {rec['slug']}: {e}")
+            r = "rejected"
+        if r != "nofill":
+            self._finalize(rec)
+        return r
 
+    def _finalize(self, rec: dict) -> None:
         filled = float(rec["acciones_llenadas"] or 0)
         if filled > 0:
             rec["resultado"] = "PENDIENTE"
@@ -430,10 +469,9 @@ class Executor:
             rec["resultado"] = "—"
             rec["pnl_usd"] = 0
         self._save()
-        log.info(f"   → {rec['estado']}: {filled:g} acc"
-                 + (f" @ {float(rec['precio_llenado'])*100:.1f}¢, costo ${rec['costo_usd']:.2f}"
+        log.info(f"   → {rec['moneda']} {rec['lado']} {rec['estado']}: {filled:g} acc"
+                 + (f" @ {float(rec['precio_llenado'])*100:.1f}¢, costo ${float(rec['costo_usd']):.2f}"
                     if filled else ""))
-        return rec
 
     def _fill(self, rec: dict, shares: float, cost: float, taker_shares: float, price: float):
         rec["acciones_llenadas"] = round(shares, 4)
@@ -441,87 +479,66 @@ class Executor:
         rec["precio_llenado"] = round(cost / shares, 4) if shares > 0 else ""
         rec["comision_est_usd"] = round(fee_estimate(taker_shares, price), 4)
 
-    def _execute_dry(self, rec: dict, token: str, limit: float) -> None:
-        """Simula la FAK: compra con $1 lo que haya en el libro a ≤ tope.
-        Si no hay nada, reintenta cada segundo hasta 10 s."""
-        t0 = self.now()
-        rec["order_id"] = f"dry-{int(t0)}"
-        while True:
-            book = self.clob.get_order_book(token)
-            levels = sorted((float(a["price"]), float(a["size"])) for a in (book.get("asks") or []))
-            usd_left, sh, cost = USD_PER_SIGNAL, 0.0, 0.0
-            for px, size in levels:
-                if px > limit + 1e-9 or usd_left <= 1e-9:
-                    break
-                take = min(size, usd_left / px)
-                sh, cost, usd_left = sh + take, cost + take * px, usd_left - take * px
-            if sh > 0:
-                self._fill(rec, sh, cost, sh, cost / sh)
-                rec["estado"] = "LLENADA" if usd_left <= 0.01 else "PARCIAL"
-                return
-            if self.now() - t0 >= self.fill_timeout or os.path.exists(self.stop_path):
-                rec["estado"] = "SIN_LLENAR"
-                best = levels[0][0] if levels else float("nan")
-                log.info(f"   ⌛ {self.fill_timeout:g}s sin nada a ≤{limit*100:.1f}¢ "
-                         f"(mejor ask {best*100:.1f}¢) → no compra")
-                return
-            self.sleep(self.poll_s)
+    def _try_dry(self, job: dict) -> str:
+        """Simula la FAK: compra con $1 lo que haya en el libro a ≤ tope."""
+        rec, limit = job["rec"], job["limit"]
+        rec["order_id"] = rec["order_id"] or f"dry-{int(job['t0'])}"
+        book = self.clob.get_order_book(job["token"])
+        levels = sorted((float(a["price"]), float(a["size"])) for a in (book.get("asks") or []))
+        usd_left, sh, cost = USD_PER_SIGNAL, 0.0, 0.0
+        for px, size in levels:
+            if px > limit + 1e-9 or usd_left <= 1e-9:
+                break
+            take = min(size, usd_left / px)
+            sh, cost, usd_left = sh + take, cost + take * px, usd_left - take * px
+        if sh <= 0:
+            return "nofill"
+        self._fill(rec, sh, cost, sh, cost / sh)
+        rec["estado"] = "LLENADA" if usd_left <= 0.01 else "PARCIAL"
+        return "filled"
 
     _NO_FILL = ("no orders found", "no match", "fully filled", "fok", "fak")
 
-    def _execute_live(self, rec: dict, token: str, limit: float, tick: str, neg_risk: bool) -> None:
-        """$1 por monto, tope = ask de la señal, FAK. Si no hay nada a ese precio,
-        reintenta cada segundo hasta 10 s. Nunca deja una orden viva en el libro."""
+    def _try_live(self, job: dict) -> str:
+        """$1 por monto, tope = ask de la señal, FAK. Nunca deja una orden viva."""
         from py_clob_client_v2.clob_types import (
             MarketOrderArgs, OrderType, PartialCreateOrderOptions)
+        rec, limit, tick = job["rec"], job["limit"], job["tick"]
+        resp, err = None, ""
+        try:
+            order = self.clob.create_market_order(
+                MarketOrderArgs(token_id=job["token"], amount=USD_PER_SIGNAL, side="BUY",
+                                price=limit, order_type=OrderType.FAK),
+                PartialCreateOrderOptions(tick_size=tick, neg_risk=job["neg_risk"]),
+            )
+            resp = self.clob.post_order(order, OrderType.FAK)
+        except Exception as e:
+            err = str(e)
+        if isinstance(resp, dict):
+            err = err or str(resp.get("errorMsg") or "")
+            if resp.get("orderID"):
+                rec["order_id"] = resp["orderID"]
 
-        t0 = self.now()
-        tries = 0
-        while True:
-            tries += 1
-            resp, err = None, ""
+        if isinstance(resp, dict) and resp.get("success", True) is not False \
+                and str(resp.get("status", "")).lower() == "matched":
             try:
-                order = self.clob.create_market_order(
-                    MarketOrderArgs(token_id=token, amount=USD_PER_SIGNAL, side="BUY",
-                                    price=limit, order_type=OrderType.FAK),
-                    PartialCreateOrderOptions(tick_size=tick, neg_risk=neg_risk),
-                )
-                resp = self.clob.post_order(order, OrderType.FAK)
-            except Exception as e:
-                err = str(e)
-            if isinstance(resp, dict):
-                err = err or str(resp.get("errorMsg") or "")
-                if resp.get("orderID"):
-                    rec["order_id"] = resp["orderID"]
+                cost = float(resp.get("makingAmount") or 0)
+                sh = float(resp.get("takingAmount") or 0)
+            except (TypeError, ValueError):
+                cost = sh = 0.0
+            if sh > 1000:                      # vino en unidades de 6 decimales
+                sh, cost = sh / 1e6, cost / 1e6
+            if sh <= 0 or cost <= 0 or cost / sh > limit + float(tick) + 1e-9:
+                cost, sh = USD_PER_SIGNAL, USD_PER_SIGNAL / limit   # supuesto conservador
+            self._fill(rec, sh, cost, sh, cost / sh)
+            rec["estado"] = "LLENADA" if cost >= USD_PER_SIGNAL - 0.01 else "PARCIAL"
+            return "filled"
 
-            filled = isinstance(resp, dict) and resp.get("success", True) is not False \
-                and str(resp.get("status", "")).lower() == "matched"
-            if filled:
-                try:
-                    cost = float(resp.get("makingAmount") or 0)
-                    sh = float(resp.get("takingAmount") or 0)
-                except (TypeError, ValueError):
-                    cost = sh = 0.0
-                if sh > 1000:                      # vino en unidades de 6 decimales
-                    sh, cost = sh / 1e6, cost / 1e6
-                if sh <= 0 or cost <= 0 or cost / sh > limit + float(tick) + 1e-9:
-                    # datos raros: supuesto conservador ($1 al tope)
-                    cost, sh = USD_PER_SIGNAL, USD_PER_SIGNAL / limit
-                self._fill(rec, sh, cost, sh, cost / sh)
-                rec["estado"] = "LLENADA" if cost >= USD_PER_SIGNAL - 0.01 else "PARCIAL"
-                return
-
-            no_fill = (not err) or any(k in err.lower() for k in self._NO_FILL)
-            if not no_fill:
-                rec["estado"] = "RECHAZADA"
-                log.error(f"   ❌ Polymarket rechazó la orden: {err[:200]}")
-                return
-            if self.now() - t0 >= self.fill_timeout or os.path.exists(self.stop_path):
-                rec["estado"] = "SIN_LLENAR"
-                log.info(f"   ⌛ {tries} intento(s) en {self.fill_timeout:g}s sin nada a "
-                         f"≤{limit*100:.1f}¢ → no compra")
-                return
-            self.sleep(self.poll_s)
+        if (not err) or any(k in err.lower() for k in self._NO_FILL):
+            return "nofill"
+        rec["estado"] = "RECHAZADA"
+        log.error(f"   ❌ Polymarket rechazó la orden {rec['slug']}: {err[:200]}")
+        return "rejected"
 
     # ── liquidación ──────────────────────────────────────────
     def settle_pending(self) -> int:
@@ -712,7 +729,8 @@ def follow(ex: Executor, path: str, overrides: dict, from_start: bool = False) -
             new = fol.poll()
             if new:
                 log.info(f"📥 {len(new)} señal(es): {new}")
-                ex.handle_signals(new)   # al instante, como el papel
+                ex.handle_signals(new, wait=False)   # al instante, como el papel
+            ex.retry_pending()                       # reintentos en paralelo (10 s c/u)
             ex.settle_pending()
             if time.time() - last_status > 300:
                 log.info(ex.status())
