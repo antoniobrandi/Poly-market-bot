@@ -122,19 +122,24 @@ def test_cli_without_live_uses_public_client(tmp_path, monkeypatch):
     assert called.get("mode") in (None, "DRY_RUN")
 
 
-# ── 2. $1 y una orden por ventana (la de mayor edge) ────────
-def test_one_order_per_window_picks_best_edge(tmp_path):
+# ── 2. $1 por señal, como el papel: una orden por mercado ───
+def test_every_signal_is_an_order_like_paper(tmp_path):
     ex, clk, g, c = make(tmp_path, live=True)
     recs = ex.handle_signals([sig(clk, "btc", edge=0.04), sig(clk, "eth", edge=0.09),
                               sig(clk, "sol", "DOWN", edge=0.06)])
-    assert len(recs) == 1 and recs[0]["moneda"] == "ETH"
-    assert len(c.posted) == 1
-    # otro ciclo en la misma ventana: no opera
-    assert ex.handle_signals([sig(clk, "xrp", edge=0.20)]) == []
-    assert len(c.posted) == 1
-    # siguiente ventana: sí
+    assert [r["moneda"] for r in recs] == ["BTC", "ETH", "SOL"]
+    assert len(c.posted) == 3
+    # misma moneda y ventana otra vez: no repite (como paper.has(slug))
+    assert ex.handle_signals([sig(clk, "btc", edge=0.20)]) == []
+    assert len(c.posted) == 3
+    # otra moneda en la misma ventana: sí
+    assert len(ex.handle_signals([sig(clk, "xrp")])) == 1
+    # siguiente ventana, misma moneda: sí (las anteriores ya se resolvieron)
+    for o in ex.state["orders"]:
+        g.resolved[o["slug"]] = "UP"
     clk.t = T0 + 900 + 30
-    assert len(ex.handle_signals([sig(clk, "xrp", ws=T0 + 900)])) == 1
+    ex.settle_pending()
+    assert len(ex.handle_signals([sig(clk, "btc", ws=T0 + 900)])) == 1
 
 
 def test_size_is_one_dollar(tmp_path):
@@ -145,10 +150,10 @@ def test_size_is_one_dollar(tmp_path):
     assert 1.0 <= args.size * args.price < 1.01        # ≈ $1, nunca menos
 
 
-def test_cancelled_unfilled_order_still_uses_window(tmp_path):
+def test_cancelled_unfilled_order_still_uses_market(tmp_path):
     ex, clk, g, c = make(tmp_path, live=True, fill="never")
     ex.handle_signals([sig(clk)])
-    assert ex.handle_signals([sig(clk, "eth")]) == []
+    assert ex.handle_signals([sig(clk)]) == []          # mismo mercado: no reintenta
     assert len(c.posted) == 1
 
 
@@ -201,7 +206,7 @@ def test_stop_during_wait_cancels_immediately(tmp_path):
     assert c.cancelled == ["0xabc"] and clk.t - t_start < 3
 
 
-# ── 4. Pérdida diaria $3 ────────────────────────────────────
+# ── 4. Pérdida diaria $5 ────────────────────────────────────
 def _lose_window(ex, clk, g, k):
     ws = T0 + 900 * k
     clk.t = ws + 60
@@ -218,8 +223,9 @@ def test_daily_loss_limit_then_next_day(tmp_path):
     placed = 0
     for k in range(8):
         placed += len(_lose_window(ex, clk, g, k))
-    assert ex.realized_today() >= -E.MAX_DAILY_LOSS - 1e-9      # nunca pasa de -$3
-    assert placed == 2                                           # 2 × ≈$1.03; una 3ª pasaría $3
+    assert E.MAX_DAILY_LOSS == 5.0
+    assert ex.realized_today() >= -E.MAX_DAILY_LOSS - 1e-9      # nunca pasa de -$5
+    assert placed == 4                                           # 4 × ≈$1.03; una 5ª pasaría $5
     assert "hasta mañana" in ex.blocked_reason(new_risk=1.03)
     # Día siguiente: vuelve a operar
     clk.t = T0 + 86400 * 2
@@ -231,8 +237,8 @@ def test_daily_loss_limit_then_next_day(tmp_path):
 def test_open_positions_count_as_risk(tmp_path):
     ex, clk, g, c = make(tmp_path, live=True)
     ex.state["orders"].append({"fecha": E.datetime.fromtimestamp(clk.t).strftime("%Y-%m-%d %H:%M:%S"),
-                               "resultado": "PIERDE", "pnl_usd": -2.5, "costo_usd": 1, "comision_est_usd": 0})
-    assert ex.handle_signals([sig(clk)]) == []        # -2.5 - 1 < -3 en el peor caso
+                               "resultado": "PIERDE", "pnl_usd": -4.5, "costo_usd": 1, "comision_est_usd": 0})
+    assert ex.handle_signals([sig(clk)]) == []        # -4.5 - 1 < -5 en el peor caso
     assert c.posted == []
 
 
@@ -270,7 +276,7 @@ def test_state_survives_restart(tmp_path):
     ex, clk, g, c = make(tmp_path, live=True)
     ex.handle_signals([sig(clk)])
     ex2 = E.Executor(live=True, clob=c, gamma=g, base_dir=str(tmp_path), now=clk.now, sleep=clk.sleep)
-    assert ex2.handle_signals([sig(clk, "eth")]) == []   # la ventana sigue usada
+    assert ex2.handle_signals([sig(clk)]) == []          # el mercado sigue usado
 
 
 # ── 7. Filtros de seguridad ─────────────────────────────────
@@ -296,7 +302,7 @@ def test_stale_signal_rejected(tmp_path):
 def test_below_market_minimum_skips_without_using_window(tmp_path):
     ex, clk, g, c = make(tmp_path, live=True, min_size=5)
     assert ex.handle_signals([sig(clk)]) == []
-    assert c.posted == [] and str(T0) not in ex.state["windows"]
+    assert c.posted == [] and sig(clk).slug not in ex.state["markets"]
 
 
 # ── 8. Lectura de senales.csv ───────────────────────────────
@@ -342,3 +348,12 @@ def test_real_scanner_csv_uses_side_ask_not_spot(tmp_path):
     assert (up.coin, up.side, up.window_start) == ("btc", "UP", 1794731400)
     assert up.price == pytest.approx(0.45) and up.edge == pytest.approx(0.0482)
     assert (down.coin, down.side) == ("hype", "DOWN") and down.price == pytest.approx(0.38)
+
+
+def test_many_signals_same_window_capped_by_daily_limit(tmp_path):
+    """7 monedas a la vez (como las 02:30): abre mientras el peor caso no pase $5."""
+    ex, clk, g, c = make(tmp_path, live=True)
+    coins = ["btc", "eth", "sol", "xrp", "doge", "hype", "bnb"]
+    recs = ex.handle_signals([sig(clk, k) for k in coins])
+    assert [r["moneda"] for r in recs] == ["BTC", "ETH", "SOL", "XRP"]
+    assert ex.open_risk() <= E.MAX_DAILY_LOSS

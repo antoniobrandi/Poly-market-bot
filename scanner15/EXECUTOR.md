@@ -38,10 +38,10 @@ adivina mal, fuérzalas: `--col side=senal --col price=ask --col edge=edge_neto`
 |---|---|
 | DRY_RUN por default | Sin `--live` usa un cliente sin llave y no crea/firma órdenes. Guarda en `ordenes_dry.csv` |
 | $1 por señal | `acciones = $1 / precio`, redondeado hacia arriba al centavo (≈$1.00–1.01) |
-| 1 orden por ventana | De las señales del mismo ciclo elige la de **mayor edge**. Una vez enviada, la ventana queda usada aunque no se llene |
+| Igual que el papel | Cada fila nueva de `senales.csv` es una orden, al instante y en el orden en que llegó. Una sola por mercado (moneda + ventana), como `paper.has(slug)`. Si varias monedas marcan señal en la misma ventana, entra en todas (mientras no pase el límite diario). Una vez enviada, ese mercado queda usado aunque no se llene |
 | Orden límite al ask | GTC al precio del ask de la señal (redondeado hacia abajo al tick). Nunca a mercado |
 | Cancelar a los 10 s | Si no se llenó toda, cancela el resto y registra lo que se llenó (PARCIAL) |
-| Pérdida diaria $3 | Cuenta lo perdido hoy **más** lo abierto como si valiera 0. Si la siguiente orden pudiera pasar de $3, no opera hasta mañana |
+| Pérdida diaria $5 | Cuenta lo perdido hoy **más** lo abierto como si valiera 0. Si la siguiente orden pudiera pasar de $5, no la manda: espera a que resuelvan las abiertas, o hasta mañana si ya no hay abiertas |
 | Archivo `STOP` | `touch STOP` → no opera, y si hay una orden esperando se cancela ya. `rm STOP` para reanudar |
 | `ordenes.csv` | precio de la señal, precio llenado, costo, comisión estimada, resultado, pago y P&L |
 
@@ -54,8 +54,12 @@ descarta señales con más de 30 s de antigüedad.
   orden. Con $1 a 50¢ son 2 acciones. Si el mercado lo rechaza, el ejecutor
   avisa "el mercado pide mínimo …" y no opera (no sube el monto solo).
 - **Comisión**: se estima con `0.07 × p × (1−p)` por acción y se resta del P&L.
-  Por eso cada pérdida cuenta ≈$1.03, y el límite de $3 corta tras 2 pérdidas
-  netas en el día. Si quieres que aguante 3, sube `MAX_DAILY_LOSS` a mano.
+  Por eso cada pérdida cuenta ≈$1.03, y caben 4 órdenes abiertas a la vez
+  dentro de $5. Con 7 señales en la misma ventana entra en las primeras 4.
+- **Cuenta compartida**: puedes apostar a mano en la misma cuenta. El ejecutor
+  solo cancela SUS órdenes (por ID, nunca "cancelar todo") y el límite de $5
+  cuenta solo sus órdenes, no tus apuestas manuales. Si tus apuestas dejan sin
+  saldo la cuenta, Polymarket rechaza la orden y queda como RECHAZADA.
 - **Cobrar ganancias**: el ejecutor no redime posiciones ganadoras; eso se
   hace en Polymarket como siempre.
 - El resultado se lee de Gamma cuando el mercado cierra (unos minutos tras la

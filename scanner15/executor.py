@@ -4,10 +4,11 @@ executor.py — ejecuta en Polymarket las señales del Scanner 15m.
 
 Seguridad primero:
   · DRY_RUN por default. Solo opera con dinero real si se corre con --live.
-  · $1 por señal, UNA orden por ventana de 15 min (la de mayor edge).
+  · $1 por señal, igual que el registro en papel del scanner: cada señal de
+    senales.csv es una orden, en el momento, una sola por mercado (moneda+ventana).
   · Orden LÍMITE al ask de la señal (nunca a mercado). Si en 10 s no se
     llena, se cancela.
-  · Pérdida diaria máxima $3: al llegar, no opera hasta el día siguiente.
+  · Pérdida diaria máxima $5: al llegar, no opera hasta el día siguiente.
   · Si existe el archivo STOP en esta carpeta, no opera.
   · Cada orden real queda en ordenes.csv (las de DRY_RUN en ordenes_dry.csv).
 
@@ -43,13 +44,12 @@ from typing import Callable, Optional
 # ═══════════════════════════════════════════════════════════
 USD_PER_SIGNAL   = 1.00   # dólares por señal
 FILL_TIMEOUT_S   = 10     # si no se llena en este tiempo, se cancela
-MAX_DAILY_LOSS   = 3.00   # pérdida diaria máxima (USD) — incluye lo abierto
+MAX_DAILY_LOSS   = 5.00   # pérdida diaria máxima (USD) — incluye lo abierto
 MIN_PRICE        = 0.30   # mismo rango que el scanner
 MAX_PRICE        = 0.70
 MIN_EDGE         = 0.03   # edge neto mínimo (después de comisión)
 MIN_SECONDS_LEFT = 120    # quedan más de 2 minutos
 MAX_SIGNAL_AGE_S = 30     # una señal más vieja que esto ya no es la misma apuesta
-GATHER_S         = 4      # en --follow: espera para juntar las señales del ciclo
 TAKER_FEE_RATE   = 0.07   # comisión estimada = acciones × rate × p × (1−p)
 WINDOW_S         = 900
 
@@ -276,11 +276,11 @@ class Executor:
         try:
             with open(self.state_path) as f:
                 st = json.load(f)
-            st.setdefault("windows", {})
+            st.setdefault("markets", {})
             st.setdefault("orders", [])
             return st
         except FileNotFoundError:
-            return {"windows": {}, "orders": []}
+            return {"markets": {}, "orders": []}
 
     def _save(self) -> None:
         tmp = self.state_path + ".tmp"
@@ -329,27 +329,19 @@ class Executor:
 
     # ── entrada principal ────────────────────────────────────
     def handle_signals(self, signals: list[Signal]) -> list[dict]:
-        """Recibe las señales de UN ciclo del scanner. Coloca a lo sumo una
-        orden por ventana: la de mayor edge entre las válidas."""
+        """Igual que el papel del scanner: cada señal válida es una orden, en el
+        orden en que llegó, y solo una por mercado (moneda + ventana)."""
         now = self.now()
-        by_window: dict[int, list[Signal]] = {}
-        for s in signals:
+        done = []
+        for s in sorted(signals, key=lambda x: x.ts):
             why = self._reject_reason(s, now)
             if why:
                 log.info(f"   ✗ {s}: {why}")
                 continue
-            by_window.setdefault(s.window_start, []).append(s)
-
-        done = []
-        for ws, group in sorted(by_window.items()):
-            if str(ws) in self.state["windows"]:
-                log.info(f"   ⏭  ventana {self._hhmm(ws)} ya usada — ignoro {len(group)} señal(es)")
+            if s.slug in self.state["markets"]:
+                log.info(f"   ⏭  {s.slug} ya tiene orden — ignoro")
                 continue
-            best = max(group, key=lambda s: s.edge)
-            if len(group) > 1:
-                log.info(f"   ↳ {len(group)} señales en la ventana {self._hhmm(ws)}; "
-                         f"elijo la de mayor edge: {best}")
-            rec = self.place(best)
+            rec = self.place(s)
             if rec:
                 done.append(rec)
         return done
@@ -415,8 +407,8 @@ class Executor:
             log.warning(f"⛔ No opero {s}: {block}")
             return None
 
-        # Desde aquí la ventana queda USADA (aunque la orden no se llene o falle):
-        # una sola orden por ventana, sin reintentos.
+        # Desde aquí el mercado queda USADO (aunque la orden no se llene o falle):
+        # una sola orden por mercado, sin reintentos — igual que el papel.
         rec = {
             "fecha": datetime.fromtimestamp(self.now()).strftime("%Y-%m-%d %H:%M:%S"),
             "modo": self.mode, "ventana_inicio": s.window_start,
@@ -427,7 +419,7 @@ class Executor:
             "comision_est_usd": 0, "estado": "ENVIANDO", "resultado": "",
             "pago_usd": "", "pnl_usd": "", "_token": token,
         }
-        self.state["windows"][str(s.window_start)] = rec["fecha"]
+        self.state["markets"][s.slug] = rec["fecha"]
         self.state["orders"].append(rec)
         self._save()
 
@@ -722,21 +714,14 @@ class CsvFollower:
 
 def follow(ex: Executor, path: str, overrides: dict, from_start: bool = False) -> None:
     fol = CsvFollower(path, overrides, from_start)
-    buf: list[Signal] = []
-    first_at = 0.0
     last_status = 0.0
     log.info(f"👀 Siguiendo {path} — Ctrl+C para salir. {ex.status()}")
     while True:
         try:
             new = fol.poll()
             if new:
-                if not buf:
-                    first_at = time.time()
-                buf.extend(new)
                 log.info(f"📥 {len(new)} señal(es): {new}")
-            if buf and time.time() - first_at >= GATHER_S:
-                batch, buf = buf, []
-                ex.handle_signals(batch)
+                ex.handle_signals(new)   # al instante, como el papel
             ex.settle_pending()
             if time.time() - last_status > 300:
                 log.info(ex.status())
@@ -766,7 +751,7 @@ def setup_logging(base_dir: str) -> None:
 def live_banner() -> None:
     print("\n" + "═" * 60)
     print("  💸  MODO --live: ÓRDENES REALES CON DINERO REAL")
-    print(f"  ${USD_PER_SIGNAL:.2f}/señal · 1 orden/ventana · límite diario ${MAX_DAILY_LOSS:.2f}")
+    print(f"  ${USD_PER_SIGNAL:.2f}/señal · 1 orden por señal (como el papel) · límite diario ${MAX_DAILY_LOSS:.2f}")
     print("  Para parar: crea el archivo STOP o Ctrl+C")
     print("═" * 60)
     for i in range(5, 0, -1):
