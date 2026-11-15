@@ -37,12 +37,12 @@ adivina mal, fuérzalas: `--col side=senal --col price=ask --col edge=edge_neto`
 | Regla | Cómo se cumple |
 |---|---|
 | DRY_RUN por default | Sin `--live` usa un cliente sin llave y no crea/firma órdenes. Guarda en `ordenes_dry.csv` |
-| $1 por señal | `acciones = $1 / precio`, redondeado hacia arriba al centavo (≈$1.00–1.01) |
+| $1 por señal | Compra **por monto**: exactamente $1, sean las acciones que sean (a 45¢ ≈ 2.2 acc; a 60¢ ≈ 1.7) |
 | Igual que el papel | Cada fila nueva de `senales.csv` es una orden, al instante y en el orden en que llegó. Una sola por mercado (moneda + ventana), como `paper.has(slug)`. Si varias monedas marcan señal en la misma ventana, entra en todas (mientras no pase el límite diario). Una vez enviada, ese mercado queda usado aunque no se llene |
-| Orden límite al ask | GTC al precio del ask de la señal (redondeado hacia abajo al tick). Nunca a mercado |
-| Cancelar a los 10 s | Si no se llenó toda, cancela el resto y registra lo que se llenó (PARCIAL) |
-| Pérdida diaria $5 | Cuenta lo perdido hoy **más** lo abierto como si valiera 0. Si la siguiente orden pudiera pasar de $5, no la manda: espera a que resuelvan las abiertas, o hasta mañana si ya no hay abiertas |
-| Archivo `STOP` | `touch STOP` → no opera, y si hay una orden esperando se cancela ya. `rm STOP` para reanudar |
+| Nunca más caro que el ask | Precio tope = ask de la señal (redondeado hacia abajo al tick). Es una orden FAK: compra lo que haya a ese precio o mejor y nunca queda viva en el libro. Así compra $1 la web de Polymarket |
+| 10 s | Si no hay nada a ese precio, reintenta cada segundo durante 10 s. Si no llena, queda SIN_LLENAR y el mercado no se vuelve a intentar |
+| Pérdida diaria $5 | Cuenta lo **cerrado** del día. Al llegar a −$5 no abre más hasta mañana. Lo abierto no frena: hasta 7 órdenes por ventana, como el papel. Peor día posible: ≈ −$5 + una ventana entera perdida |
+| Archivo `STOP` | `touch STOP` → no opera, y corta los reintentos al instante. `rm STOP` para reanudar |
 | `ordenes.csv` | precio de la señal, precio llenado, costo, comisión estimada, resultado, pago y P&L |
 
 Además re-chequea lo mismo que el scanner (30–70¢, edge ≥3¢, quedan >2 min) y
@@ -50,12 +50,11 @@ descarta señales con más de 30 s de antigüedad.
 
 ## Ojo
 
-- **Mínimo de acciones**: muchos mercados de Polymarket piden 5 acciones por
-  orden. Con $1 a 50¢ son 2 acciones. Si el mercado lo rechaza, el ejecutor
-  avisa "el mercado pide mínimo …" y no opera (no sube el monto solo).
-- **Comisión**: se estima con `0.07 × p × (1−p)` por acción y se resta del P&L.
-  Por eso cada pérdida cuenta ≈$1.03, y caben 4 órdenes abiertas a la vez
-  dentro de $5. Con 7 señales en la misma ventana entra en las primeras 4.
+- **Mínimo de 5 acciones**: aplica a órdenes que quedan en el libro. Por eso el
+  ejecutor compra por monto (FAK), igual que la web. Si Polymarket rechazara
+  la de $1, queda como RECHAZADA y no se gasta nada.
+- **Comisión**: se estima con `0.07 × p × (1−p)` por acción y se resta del P&L
+  (cada pérdida cuenta ≈$1.03).
 - **Cuenta compartida**: puedes apostar a mano en la misma cuenta. El ejecutor
   solo cancela SUS órdenes (por ID, nunca "cancelar todo") y el límite de $5
   cuenta solo sus órdenes, no tus apuestas manuales. Si tus apuestas dejan sin

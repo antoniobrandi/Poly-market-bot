@@ -42,43 +42,35 @@ class FakeGamma:
 
 
 class FakeClob:
-    """Simula CLOB: libro con un ask fijo; órdenes que se llenan según `fill`."""
+    """CLOB falso: libro con un ask fijo y compras FAK por monto.
+    fill: all_now | partial | never | reject ; fill_after: intentos sin llenar antes de llenar."""
 
-    def __init__(self, best_ask=0.50, min_size=0, fill="all_now"):
-        self.best_ask, self.min_size, self.fill = best_ask, min_size, fill
-        self.created, self.posted, self.cancelled, self.market_orders = [], [], [], 0
-        self._polls = 0
+    def __init__(self, best_ask=0.50, fill="all_now", fill_after=0):
+        self.best_ask, self.fill, self.fill_after = best_ask, fill, fill_after
+        self.market_args, self.posted, self.limit_orders = [], [], 0
 
     def get_order_book(self, token):
         return {"asks": [{"price": str(self.best_ask), "size": "100"}, {"price": "0.99", "size": "5"}],
-                "bids": [], "tick_size": "0.01", "min_order_size": str(self.min_size), "neg_risk": False}
+                "bids": [], "tick_size": "0.01", "min_order_size": "5", "neg_risk": False}
 
-    def create_order(self, args, options):
-        self.created.append((args, options))
+    def create_order(self, *a, **k):
+        self.limit_orders += 1
+        raise AssertionError("no debe dejar órdenes en el libro")
+
+    def create_market_order(self, args, options):
+        self.market_args.append((args, options))
         return {"args": args}
-
-    def create_market_order(self, *a, **k):
-        self.market_orders += 1
-        raise AssertionError("¡nunca debe usar órdenes a mercado!")
 
     def post_order(self, order, order_type):
         self.posted.append(order_type)
-        a = order["args"]
-        if self.fill == "all_now":
-            return {"success": True, "orderID": "0xabc", "status": "matched",
-                    "makingAmount": str(round(a.size * a.price, 4)), "takingAmount": str(a.size)}
-        return {"success": True, "orderID": "0xabc", "status": "live"}
-
-    def get_order(self, oid):
-        self._polls += 1
-        a = self.created[-1][0]
-        if self.fill == "partial":
-            return {"status": "LIVE", "size_matched": str(round(a.size / 2, 2))}
-        return {"status": "LIVE", "size_matched": "0"}
-
-    def cancel_order(self, payload):
-        self.cancelled.append(payload.orderID)
-        return {"canceled": [payload.orderID]}
+        a, n = order["args"], len(self.posted)
+        if self.fill == "reject":
+            return {"success": False, "errorMsg": "not enough balance / allowance"}
+        if self.fill == "never" or n <= self.fill_after:
+            return {"success": False, "errorMsg": "no orders found to match with FAK order"}
+        usd = a.amount if self.fill == "all_now" else a.amount / 2
+        return {"success": True, "orderID": f"0x{n}", "status": "matched",
+                "makingAmount": str(usd), "takingAmount": str(round(usd / a.price, 4))}
 
 
 def make(tmp_path, live=False, t=T0 + 60, **clob_kw):
@@ -109,7 +101,7 @@ def test_dry_run_never_creates_or_posts_orders(tmp_path):
     ex, clk, g, c = make(tmp_path)
     [rec] = ex.handle_signals([sig(clk)])
     assert rec["estado"] == "LLENADA" and rec["modo"] == "DRY_RUN"
-    assert c.created == [] and c.posted == [] and c.cancelled == []
+    assert c.market_args == [] and c.posted == []
     assert not os.path.exists(os.path.join(tmp_path, "ordenes.csv"))   # el real queda limpio
 
 
@@ -144,66 +136,83 @@ def test_every_signal_is_an_order_like_paper(tmp_path):
 
 def test_size_is_one_dollar(tmp_path):
     ex, clk, g, c = make(tmp_path, live=True)
-    ex.handle_signals([sig(clk, price=0.53)])
-    args, _ = c.created[0]
-    assert args.side == "BUY"
-    assert 1.0 <= args.size * args.price < 1.01        # ≈ $1, nunca menos
+    [rec] = ex.handle_signals([sig(clk, price=0.53)])
+    args, _ = c.market_args[0]
+    assert args.side == "BUY" and args.amount == 1.0       # $1 exacto, sin importar acciones
+    assert float(rec["costo_usd"]) == pytest.approx(1.0)
+    assert float(rec["acciones_llenadas"]) == pytest.approx(1 / 0.53, abs=1e-3)
 
 
-def test_cancelled_unfilled_order_still_uses_market(tmp_path):
+def test_unfilled_still_uses_market(tmp_path):
     ex, clk, g, c = make(tmp_path, live=True, fill="never")
     ex.handle_signals([sig(clk)])
-    assert ex.handle_signals([sig(clk)]) == []          # mismo mercado: no reintenta
-    assert len(c.posted) == 1
+    n = len(c.posted)
+    assert ex.handle_signals([sig(clk)]) == []          # mismo mercado: no vuelve a entrar
+    assert len(c.posted) == n
 
 
-# ── 3. Límite al ask; cancelar a los 10 s ───────────────────
-def test_limit_order_at_signal_ask_gtc_not_market(tmp_path):
+# ── 3. Tope = ask de la señal; reintenta hasta 10 s ─────────
+def test_price_cap_is_signal_ask_fak_never_resting(tmp_path):
     ex, clk, g, c = make(tmp_path, live=True)
     ex.handle_signals([sig(clk, price=0.537)])
-    args, opts = c.created[0]
-    assert args.price == pytest.approx(0.53)          # redondeo hacia abajo al tick
-    assert c.posted == ["GTC"] and c.market_orders == 0
-    assert opts.tick_size == "0.01"
+    args, opts = c.market_args[0]
+    assert args.price == pytest.approx(0.53)          # tope redondeado hacia abajo al tick
+    assert args.order_type == "FAK" and c.posted == ["FAK"]
+    assert c.limit_orders == 0 and opts.tick_size == "0.01"
 
 
-def test_unfilled_cancels_after_10s(tmp_path):
+def test_min_5_shares_does_not_block_one_dollar(tmp_path):
+    ex, clk, g, c = make(tmp_path, live=True)          # el libro dice min_order_size 5
+    [rec] = ex.handle_signals([sig(clk, price=0.50)])
+    assert rec["estado"] == "LLENADA" and float(rec["acciones_llenadas"]) == pytest.approx(2.0)
+
+
+def test_unfilled_retries_10s_then_gives_up(tmp_path):
     ex, clk, g, c = make(tmp_path, live=True, fill="never")
     t_start = clk.t
     [rec] = ex.handle_signals([sig(clk)])
-    assert c.cancelled == ["0xabc"]
-    assert 10 <= clk.t - t_start <= 12
-    assert rec["estado"] == "CANCELADA" and rec["resultado"] == "—"
+    assert 10 <= clk.t - t_start <= 12 and 10 <= len(c.posted) <= 12
+    assert rec["estado"] == "SIN_LLENAR" and rec["resultado"] == "—"
     assert float(rec["pnl_usd"]) == 0
+
+
+def test_fills_on_a_retry(tmp_path):
+    ex, clk, g, c = make(tmp_path, live=True, fill_after=3)
+    [rec] = ex.handle_signals([sig(clk)])
+    assert len(c.posted) == 4 and rec["estado"] == "LLENADA"
 
 
 def test_partial_fill_is_recorded(tmp_path):
     ex, clk, g, c = make(tmp_path, live=True, fill="partial")
     [rec] = ex.handle_signals([sig(clk)])
-    assert c.cancelled == ["0xabc"]
-    assert rec["estado"] == "PARCIAL"
-    assert 0 < rec["acciones_llenadas"] < rec["acciones_pedidas"]
-    assert rec["resultado"] == "PENDIENTE"
+    assert rec["estado"] == "PARCIAL" and float(rec["costo_usd"]) == pytest.approx(0.5)
+    assert rec["resultado"] == "PENDIENTE" and len(c.posted) == 1
 
 
-def test_dry_run_cancels_when_ask_above_limit(tmp_path):
+def test_rejection_is_not_retried(tmp_path):
+    ex, clk, g, c = make(tmp_path, live=True, fill="reject")
+    [rec] = ex.handle_signals([sig(clk)])
+    assert rec["estado"] == "RECHAZADA" and len(c.posted) == 1
+
+
+def test_dry_run_no_fill_when_ask_above_cap(tmp_path):
     ex, clk, g, c = make(tmp_path, best_ask=0.55)
     [rec] = ex.handle_signals([sig(clk, price=0.50)])
-    assert rec["estado"] == "CANCELADA"
+    assert rec["estado"] == "SIN_LLENAR"
     assert clk.t - (T0 + 60) >= 10
 
 
-def test_stop_during_wait_cancels_immediately(tmp_path):
+def test_stop_during_retries_stops(tmp_path):
     ex, clk, g, c = make(tmp_path, live=True, fill="never")
-    orig = c.get_order
+    orig = c.post_order
 
-    def get_order_then_stop(oid):
+    def post_then_stop(order, ot):
         open(ex.stop_path, "w").close()
-        return orig(oid)
-    c.get_order = get_order_then_stop
+        return orig(order, ot)
+    c.post_order = post_then_stop
     t_start = clk.t
-    ex.handle_signals([sig(clk)])
-    assert c.cancelled == ["0xabc"] and clk.t - t_start < 3
+    [rec] = ex.handle_signals([sig(clk)])
+    assert len(c.posted) == 1 and clk.t - t_start < 2 and rec["estado"] == "SIN_LLENAR"
 
 
 # ── 4. Pérdida diaria $5 ────────────────────────────────────
@@ -224,9 +233,9 @@ def test_daily_loss_limit_then_next_day(tmp_path):
     for k in range(8):
         placed += len(_lose_window(ex, clk, g, k))
     assert E.MAX_DAILY_LOSS == 5.0
-    assert ex.realized_today() >= -E.MAX_DAILY_LOSS - 1e-9      # nunca pasa de -$5
-    assert placed == 4                                           # 4 × ≈$1.03; una 5ª pasaría $5
-    assert "hasta mañana" in ex.blocked_reason(new_risk=1.03)
+    assert placed == 5                     # 4 pérdidas = −4.14 sigue; la 5ª pasa de −$5 y para
+    assert ex.realized_today() > -E.MAX_DAILY_LOSS - 1.1
+    assert "límite diario alcanzado" in ex.blocked_reason()
     # Día siguiente: vuelve a operar
     clk.t = T0 + 86400 * 2
     ws = int(clk.t // 900 * 900)
@@ -234,12 +243,11 @@ def test_daily_loss_limit_then_next_day(tmp_path):
     assert len(ex.handle_signals([sig(clk, ws=ws)])) == 1
 
 
-def test_open_positions_count_as_risk(tmp_path):
+def test_open_positions_do_not_block(tmp_path):
     ex, clk, g, c = make(tmp_path, live=True)
     ex.state["orders"].append({"fecha": E.datetime.fromtimestamp(clk.t).strftime("%Y-%m-%d %H:%M:%S"),
                                "resultado": "PIERDE", "pnl_usd": -4.5, "costo_usd": 1, "comision_est_usd": 0})
-    assert ex.handle_signals([sig(clk)]) == []        # -4.5 - 1 < -5 en el peor caso
-    assert c.posted == []
+    assert len(ex.handle_signals([sig(clk)])) == 1    # −4.5 cerrado aún no llega a −5
 
 
 # ── 5. Archivo STOP ─────────────────────────────────────────
@@ -299,12 +307,6 @@ def test_stale_signal_rejected(tmp_path):
     assert ex.handle_signals([s]) == []
 
 
-def test_below_market_minimum_skips_without_using_window(tmp_path):
-    ex, clk, g, c = make(tmp_path, live=True, min_size=5)
-    assert ex.handle_signals([sig(clk)]) == []
-    assert c.posted == [] and sig(clk).slug not in ex.state["markets"]
-
-
 # ── 8. Lectura de senales.csv ───────────────────────────────
 def test_csv_follower_reads_new_rows(tmp_path):
     path = tmp_path / "senales.csv"
@@ -350,13 +352,23 @@ def test_real_scanner_csv_uses_side_ask_not_spot(tmp_path):
     assert (down.coin, down.side) == ("hype", "DOWN") and down.price == pytest.approx(0.38)
 
 
-def test_many_signals_same_window_capped_by_daily_limit(tmp_path):
-    """7 monedas a la vez (como las 02:30): abre mientras el peor caso no pase $5."""
+def test_seven_signals_same_window_all_go_like_paper(tmp_path):
+    """7 monedas a la vez (como las 02:30): entra en las 7, $1 cada una."""
     ex, clk, g, c = make(tmp_path, live=True)
     coins = ["btc", "eth", "sol", "xrp", "doge", "hype", "bnb"]
     recs = ex.handle_signals([sig(clk, k) for k in coins])
-    assert [r["moneda"] for r in recs] == ["BTC", "ETH", "SOL", "XRP"]
-    assert ex.open_risk() <= E.MAX_DAILY_LOSS
+    assert [r["moneda"] for r in recs] == [k.upper() for k in coins]
+    assert sum(float(r["costo_usd"]) for r in recs) == pytest.approx(7.0)
+
+
+def test_follow_reads_first_signal_when_csv_created_later(tmp_path):
+    path = tmp_path / "senales.csv"
+    fol = E.CsvFollower(str(path), {})
+    assert fol.poll() == []                                   # aún no existe
+    path.write_text("hora,slug,moneda,lado,precio,target,seg_rest,prob_justa_up,up_ask,down_ask,edge,tendencia,libro\n"
+                    "2026-11-15 02:30:07,btc-updown-15m-1794731400,BTC,Up,64512.02,64495.39,894,0.5155,0.45,0.56,0.0482,0,-0.354\n")
+    [s1] = fol.poll()
+    assert s1.coin == "btc" and s1.price == pytest.approx(0.45)
 
 
 def test_gamma_falls_back_to_events(monkeypatch):

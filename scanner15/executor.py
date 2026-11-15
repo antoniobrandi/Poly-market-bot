@@ -6,8 +6,11 @@ Seguridad primero:
   · DRY_RUN por default. Solo opera con dinero real si se corre con --live.
   · $1 por señal, igual que el registro en papel del scanner: cada señal de
     senales.csv es una orden, en el momento, una sola por mercado (moneda+ventana).
-  · Orden LÍMITE al ask de la señal (nunca a mercado). Si en 10 s no se
-    llena, se cancela.
+  · Compra por MONTO ($1), con precio tope = ask de la señal: nunca paga más.
+    Es FAK (llena lo que haya a ese precio, no queda en el libro). Si no hay
+    nada al ask, reintenta cada segundo hasta 10 s y luego se rinde.
+    Así lo compra la web de Polymarket; una orden que queda en el libro
+    exige mínimo 5 acciones y con $1 no alcanza.
   · Pérdida diaria máxima $5: al llegar, no opera hasta el día siguiente.
   · Si existe el archivo STOP en esta carpeta, no opera.
   · Cada orden real queda en ordenes.csv (las de DRY_RUN en ordenes_dry.csv).
@@ -43,8 +46,8 @@ from typing import Callable, Optional
 #  REGLAS — cambiarlas exige editar este archivo a propósito
 # ═══════════════════════════════════════════════════════════
 USD_PER_SIGNAL   = 1.00   # dólares por señal
-FILL_TIMEOUT_S   = 10     # si no se llena en este tiempo, se cancela
-MAX_DAILY_LOSS   = 5.00   # pérdida diaria máxima (USD) — incluye lo abierto
+FILL_TIMEOUT_S   = 10     # reintenta hasta 10 s si no hay nada al ask; después se rinde
+MAX_DAILY_LOSS   = 5.00   # pérdida diaria (USD) ya cerrada; al llegar, no opera hasta mañana
 MIN_PRICE        = 0.30   # mismo rango que el scanner
 MAX_PRICE        = 0.70
 MIN_EDGE         = 0.03   # edge neto mínimo (después de comisión)
@@ -82,9 +85,6 @@ def force_ipv4() -> None:
 def floor_to(x: float, step: float) -> float:
     return math.floor(x / step + 1e-9) * step
 
-
-def ceil_to(x: float, step: float) -> float:
-    return math.ceil(x / step - 1e-9) * step
 
 
 def fee_estimate(shares: float, price: float) -> float:
@@ -325,14 +325,6 @@ class Executor:
         real = self.realized_today()
         if real <= -MAX_DAILY_LOSS + 1e-9:
             return f"límite diario alcanzado ({real:+.2f} USD) — vuelve mañana"
-        abierto = self.open_risk()
-        worst = real - abierto - new_risk
-        if worst < -MAX_DAILY_LOSS - 1e-9:
-            if abierto > 0:
-                return (f"en el peor caso pasaría el límite diario (realizado {real:+.2f}, "
-                        f"abierto {abierto:.2f}) — espero a que resuelvan")
-            return (f"una pérdida más pasaría el límite de ${MAX_DAILY_LOSS:.2f} "
-                    f"(realizado {real:+.2f}) — no opero hasta mañana")
         return None
 
     # ── entrada principal ────────────────────────────────────
@@ -398,22 +390,11 @@ class Executor:
             return None
         tick = str(book.get("tick_size") or market.get("orderPriceMinTickSize") or "0.01")
         tick_f = float(tick)
-        min_size = float(book.get("min_order_size") or market.get("orderMinSize") or 0)
         neg_risk = bool(book.get("neg_risk") if book.get("neg_risk") is not None
                         else market.get("negRisk", False))
 
-        limit = round(floor_to(s.price, tick_f), 6)  # nunca pagar más que el ask de la señal
-        # ceil: que el costo no quede debajo de $1 (mínimo de órdenes ejecutables)
-        shares = round(ceil_to(USD_PER_SIGNAL / limit, 0.01), 2)
-        if shares < min_size:
-            log.warning(f"   ⚠️  {s}: ${USD_PER_SIGNAL:.2f} compra {shares} acciones y el "
-                        f"mercado pide mínimo {min_size:g} (≈${min_size*limit:.2f}). No opero.")
-            return None
-        new_risk = limit * shares + fee_estimate(shares, limit)
-        block = self.blocked_reason(new_risk=new_risk)
-        if block:
-            log.warning(f"⛔ No opero {s}: {block}")
-            return None
+        limit = round(floor_to(s.price, tick_f), 6)  # tope: nunca pagar más que el ask de la señal
+        shares = round(USD_PER_SIGNAL / limit, 4)    # referencia; se compra por monto ($1)
 
         # Desde aquí el mercado queda USADO (aunque la orden no se llene o falle):
         # una sola orden por mercado, sin reintentos — igual que el papel.
@@ -432,12 +413,12 @@ class Executor:
         self._save()
 
         log.info(f"{'🧪' if not self.live else '💸'} [{self.mode}] BUY {s.coin.upper()} {s.side} "
-                 f"límite {limit*100:.1f}¢ × {shares} acc (≈${limit*shares:.2f}) | {s.slug}")
+                 f"${USD_PER_SIGNAL:.2f} tope {limit*100:.1f}¢ (≈{shares:.2f} acc) | {s.slug}")
         try:
             if self.live:
-                self._execute_live(rec, token, limit, shares, tick, neg_risk)
+                self._execute_live(rec, token, limit, tick, neg_risk)
             else:
-                self._execute_dry(rec, token, limit, shares)
+                self._execute_dry(rec, token, limit)
         except Exception as e:
             rec["estado"] = "ERROR"
             log.error(f"   ❌ Error con la orden: {e}")
@@ -449,7 +430,7 @@ class Executor:
             rec["resultado"] = "—"
             rec["pnl_usd"] = 0
         self._save()
-        log.info(f"   → {rec['estado']}: {filled:g}/{shares} acc"
+        log.info(f"   → {rec['estado']}: {filled:g} acc"
                  + (f" @ {float(rec['precio_llenado'])*100:.1f}¢, costo ${rec['costo_usd']:.2f}"
                     if filled else ""))
         return rec
@@ -460,92 +441,87 @@ class Executor:
         rec["precio_llenado"] = round(cost / shares, 4) if shares > 0 else ""
         rec["comision_est_usd"] = round(fee_estimate(taker_shares, price), 4)
 
-    def _execute_dry(self, rec: dict, token: str, limit: float, shares: float) -> None:
-        """Simula: si en algún momento de los 10 s el mejor ask ≤ límite, se llena."""
+    def _execute_dry(self, rec: dict, token: str, limit: float) -> None:
+        """Simula la FAK: compra con $1 lo que haya en el libro a ≤ tope.
+        Si no hay nada, reintenta cada segundo hasta 10 s."""
         t0 = self.now()
+        rec["order_id"] = f"dry-{int(t0)}"
         while True:
             book = self.clob.get_order_book(token)
-            asks = [float(a["price"]) for a in (book.get("asks") or [])]
-            best = min(asks) if asks else None
-            if best is not None and best <= limit + 1e-9:
-                self._fill(rec, shares, shares * limit, shares, limit)
-                rec["estado"] = "LLENADA"
-                rec["order_id"] = f"dry-{int(t0)}"
+            levels = sorted((float(a["price"]), float(a["size"])) for a in (book.get("asks") or []))
+            usd_left, sh, cost = USD_PER_SIGNAL, 0.0, 0.0
+            for px, size in levels:
+                if px > limit + 1e-9 or usd_left <= 1e-9:
+                    break
+                take = min(size, usd_left / px)
+                sh, cost, usd_left = sh + take, cost + take * px, usd_left - take * px
+            if sh > 0:
+                self._fill(rec, sh, cost, sh, cost / sh)
+                rec["estado"] = "LLENADA" if usd_left <= 0.01 else "PARCIAL"
                 return
-            if self.now() - t0 >= self.fill_timeout:
-                rec["estado"] = "CANCELADA"
-                rec["order_id"] = f"dry-{int(t0)}"
-                log.info(f"   ⌛ {self.fill_timeout:g}s sin llenarse (mejor ask "
-                         f"{best*100 if best else float('nan'):.1f}¢) → cancelada")
+            if self.now() - t0 >= self.fill_timeout or os.path.exists(self.stop_path):
+                rec["estado"] = "SIN_LLENAR"
+                best = levels[0][0] if levels else float("nan")
+                log.info(f"   ⌛ {self.fill_timeout:g}s sin nada a ≤{limit*100:.1f}¢ "
+                         f"(mejor ask {best*100:.1f}¢) → no compra")
                 return
             self.sleep(self.poll_s)
 
-    def _execute_live(self, rec: dict, token: str, limit: float, shares: float,
-                      tick: str, neg_risk: bool) -> None:
+    _NO_FILL = ("no orders found", "no match", "fully filled", "fok", "fak")
+
+    def _execute_live(self, rec: dict, token: str, limit: float, tick: str, neg_risk: bool) -> None:
+        """$1 por monto, tope = ask de la señal, FAK. Si no hay nada a ese precio,
+        reintenta cada segundo hasta 10 s. Nunca deja una orden viva en el libro."""
         from py_clob_client_v2.clob_types import (
-            OrderArgs, OrderPayload, OrderType, PartialCreateOrderOptions)
-
-        order = self.clob.create_order(
-            OrderArgs(token_id=token, price=limit, size=shares, side="BUY"),
-            PartialCreateOrderOptions(tick_size=tick, neg_risk=neg_risk),
-        )
-        resp = self.clob.post_order(order, OrderType.GTC)  # límite, NO mercado
-        if not isinstance(resp, dict) or not resp.get("success", True) or not resp.get("orderID"):
-            rec["estado"] = "RECHAZADA"
-            log.error(f"   ❌ Polymarket rechazó la orden: {resp}")
-            return
-        oid = resp["orderID"]
-        rec["order_id"] = oid
-        self._save()
-
-        # Lo que se cruzó al instante fue como taker (paga comisión).
-        taker_sh = taker_cost = 0.0
-        if str(resp.get("status", "")).lower() == "matched":
-            try:
-                taker_cost = float(resp.get("makingAmount") or 0)
-                taker_sh = float(resp.get("takingAmount") or 0)
-            except (TypeError, ValueError):
-                taker_sh = taker_cost = 0.0
-            if taker_sh > shares * 1000:          # vino en unidades de 6 decimales
-                taker_sh, taker_cost = taker_sh / 1e6, taker_cost / 1e6
-            if (taker_sh <= 0 or taker_sh > shares + 0.01
-                    or taker_cost / taker_sh > limit + float(tick) + 1e-9):
-                taker_sh = taker_cost = 0.0      # datos raros: uso el supuesto conservador
+            MarketOrderArgs, OrderType, PartialCreateOrderOptions)
 
         t0 = self.now()
-        matched = taker_sh
-        while (matched < shares - 1e-6 and self.now() - t0 < self.fill_timeout
-               and not os.path.exists(self.stop_path)):
+        tries = 0
+        while True:
+            tries += 1
+            resp, err = None, ""
+            try:
+                order = self.clob.create_market_order(
+                    MarketOrderArgs(token_id=token, amount=USD_PER_SIGNAL, side="BUY",
+                                    price=limit, order_type=OrderType.FAK),
+                    PartialCreateOrderOptions(tick_size=tick, neg_risk=neg_risk),
+                )
+                resp = self.clob.post_order(order, OrderType.FAK)
+            except Exception as e:
+                err = str(e)
+            if isinstance(resp, dict):
+                err = err or str(resp.get("errorMsg") or "")
+                if resp.get("orderID"):
+                    rec["order_id"] = resp["orderID"]
+
+            filled = isinstance(resp, dict) and resp.get("success", True) is not False \
+                and str(resp.get("status", "")).lower() == "matched"
+            if filled:
+                try:
+                    cost = float(resp.get("makingAmount") or 0)
+                    sh = float(resp.get("takingAmount") or 0)
+                except (TypeError, ValueError):
+                    cost = sh = 0.0
+                if sh > 1000:                      # vino en unidades de 6 decimales
+                    sh, cost = sh / 1e6, cost / 1e6
+                if sh <= 0 or cost <= 0 or cost / sh > limit + float(tick) + 1e-9:
+                    # datos raros: supuesto conservador ($1 al tope)
+                    cost, sh = USD_PER_SIGNAL, USD_PER_SIGNAL / limit
+                self._fill(rec, sh, cost, sh, cost / sh)
+                rec["estado"] = "LLENADA" if cost >= USD_PER_SIGNAL - 0.01 else "PARCIAL"
+                return
+
+            no_fill = (not err) or any(k in err.lower() for k in self._NO_FILL)
+            if not no_fill:
+                rec["estado"] = "RECHAZADA"
+                log.error(f"   ❌ Polymarket rechazó la orden: {err[:200]}")
+                return
+            if self.now() - t0 >= self.fill_timeout or os.path.exists(self.stop_path):
+                rec["estado"] = "SIN_LLENAR"
+                log.info(f"   ⌛ {tries} intento(s) en {self.fill_timeout:g}s sin nada a "
+                         f"≤{limit*100:.1f}¢ → no compra")
+                return
             self.sleep(self.poll_s)
-            try:
-                o = self.clob.get_order(oid) or {}
-                matched = float(o.get("size_matched") or 0)
-                if str(o.get("status", "")).upper() in ("MATCHED", "CANCELED", "CANCELLED"):
-                    break
-            except Exception as e:
-                log.warning(f"   get_order falló: {e}")
-
-        if matched < shares - 1e-6:
-            try:
-                self.clob.cancel_order(OrderPayload(orderID=oid))
-                log.info(f"   ⌛ {self.fill_timeout:g}s → cancelo el resto de la orden")
-            except Exception as e:
-                log.error(f"   ⚠️  No pude cancelar {oid}: {e} — revísala en Polymarket")
-            try:  # leer lo llenado DESPUÉS de cancelar (pudo llenarse en medio)
-                matched = float((self.clob.get_order(oid) or {}).get("size_matched") or matched)
-            except Exception:
-                pass
-
-        matched = min(max(matched, taker_sh), shares)
-        if matched <= 0:
-            rec["estado"] = "CANCELADA"
-            return
-        if taker_sh <= 0:  # sin datos del cruce inicial: asumo todo taker al límite
-            taker_sh, taker_cost = matched, matched * limit
-        maker_sh = max(0.0, matched - taker_sh)          # lo que se llenó reposando
-        cost = taker_cost + maker_sh * limit
-        self._fill(rec, matched, cost, taker_sh, cost / matched)
-        rec["estado"] = "LLENADA" if matched >= shares - 1e-6 else "PARCIAL"
 
     # ── liquidación ──────────────────────────────────────────
     def settle_pending(self) -> int:
@@ -665,10 +641,17 @@ class CsvFollower:
         self.cols: dict = {}
         self.pos = 0
         self.from_start = from_start
+        self._warned_missing = False
 
     def _open_header(self) -> bool:
         if not os.path.exists(self.path):
+            if not self._warned_missing:
+                log.info(f"📄 {self.path} aún no existe — espero a que el scanner escriba "
+                         f"la primera señal")
+                self._warned_missing = True
             return False
+        if self._warned_missing:   # se creó después de arrancar: todo lo que trae es nuevo
+            self.from_start, self._warned_missing = True, False
         with open(self.path, newline="", encoding="utf-8-sig") as f:
             first = f.readline()
             if not first.endswith("\n"):
