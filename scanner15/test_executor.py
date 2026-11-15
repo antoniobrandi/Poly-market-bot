@@ -327,3 +327,18 @@ def test_parsers():
     assert E.parse_num("3.1") == pytest.approx(0.031)
     assert E.parse_side("🟢 UP") == "UP" and E.parse_side("Baja") == "DOWN"
     assert E.parse_side("") is None and E.parse_side("—") is None
+
+
+def test_real_scanner_csv_uses_side_ask_not_spot(tmp_path):
+    """Formato real de scanner.py: 'precio' es el spot; el precio va en up_ask/down_ask."""
+    path = tmp_path / "senales.csv"
+    path.write_text("hora,slug,moneda,lado,precio,target,seg_rest,prob_justa_up,up_ask,down_ask,edge,tendencia,libro\n")
+    fol = E.CsvFollower(str(path), {})
+    assert fol.poll() == []
+    with open(path, "a") as f:
+        f.write("2026-11-15 02:30:07,btc-updown-15m-1794731400,BTC,Up,64512.02,64495.39,894,0.5155,0.45,0.56,0.0482,0,-0.354\n")
+        f.write("2026-11-15 02:30:40,hype-updown-15m-1794731400,HYPE,Down,65.4075,65.36,861,0.5395,0.64,0.38,0.064,0,0.27\n")
+    up, down = fol.poll()
+    assert (up.coin, up.side, up.window_start) == ("btc", "UP", 1794731400)
+    assert up.price == pytest.approx(0.45) and up.edge == pytest.approx(0.0482)
+    assert (down.coin, down.side) == ("hype", "DOWN") and down.price == pytest.approx(0.38)

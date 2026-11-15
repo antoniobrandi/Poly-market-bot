@@ -607,9 +607,16 @@ COLUMN_HINTS = {
 def map_columns(header: list[str], overrides: dict) -> dict:
     normed = {_norm(h): h for h in header}
     out = {}
+    # El scanner escribe up_ask y down_ask; "precio" ahí es el spot de la cripto.
+    for side in ("up", "down"):
+        hit = next((o for n, o in normed.items() if "ask" in n and side in n.split("_")), None)
+        if hit:
+            out[f"ask_{side}"] = hit
     for key, hints in COLUMN_HINTS.items():
         if key in overrides:
             out[key] = overrides[key]
+            continue
+        if key == "price" and "ask_up" in out and "ask_down" in out:
             continue
         for h in hints:                       # nombre exacto primero
             if h in normed:
@@ -638,7 +645,10 @@ def row_to_signal(row: dict, cols: dict, arrival: float) -> Optional[Signal]:
         window = int(t // WINDOW_S * WINDOW_S) if t else None
     coin = coin or re.sub(r"(usdt|usdc|usd)$", "",
                           _norm(row.get(cols.get("coin", ""), "")).split("_")[0])
-    price = parse_num(row.get(cols.get("price", "")))
+    if "price" in cols:
+        price = parse_num(row.get(cols["price"]))
+    else:
+        price = parse_num(row.get(cols.get("ask_up" if side == "UP" else "ask_down", "")))
     edge = parse_num(row.get(cols.get("edge", "")))
     if not coin or price is None or edge is None:
         return None
@@ -667,6 +677,8 @@ class CsvFollower:
             self.pos = f.tell() if self.from_start else os.path.getsize(self.path)
         self.cols = map_columns(self.header, self.overrides)
         need = [k for k in ("side", "price", "edge") if k not in self.cols]
+        if "price" in need and "ask_up" in self.cols and "ask_down" in self.cols:
+            need.remove("price")
         if "coin" not in self.cols and "window" not in self.cols:
             need.append("coin")
         log.info(f"📄 {self.path}: columnas {self.header}")
