@@ -19,3 +19,12 @@ agent_state.json
 
 # OS
 .DS_Store
+
+# Scanner 15m / executor: datos locales
+scanner15/ordenes*.csv
+scanner15/executor_state*.json
+scanner15/senales.csv
+scanner15/papel.json
+scanner15/STOP
+scanner15/mercado.csv
+scanner15/resultados.csv
