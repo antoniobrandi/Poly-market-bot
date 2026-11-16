@@ -382,10 +382,16 @@ class Executor:
             log.warning(f"⛔ No opero {s}: {block}")
             return None
 
-        try:
-            market = self.gamma.market(s.slug)
-        except Exception as e:
-            log.error(f"   No pude leer el mercado {s.slug}: {e}")
+        market, err = None, None
+        for intento in range(3):            # la red de casa a veces corta la conexión
+            try:
+                market, err = self.gamma.market(s.slug), None
+                break
+            except Exception as e:
+                err = e
+                self.sleep(0.5)
+        if err is not None:
+            log.error(f"   No pude leer el mercado {s.slug} (3 intentos): {err}")
             return None
         if not market or market.get("closed") or market.get("acceptingOrders") is False:
             log.warning(f"   Mercado {s.slug} no disponible / no acepta órdenes")
@@ -395,10 +401,16 @@ class Executor:
             log.error(f"   No encontré el token {s.side} en {s.slug}")
             return None
 
-        try:
-            book = self.clob.get_order_book(token)
-        except Exception as e:
-            log.error(f"   No pude leer el orderbook: {e}")
+        book, err = None, None
+        for intento in range(3):
+            try:
+                book, err = self.clob.get_order_book(token), None
+                break
+            except Exception as e:
+                err = e
+                self.sleep(0.5)
+        if err is not None:
+            log.error(f"   No pude leer el orderbook (3 intentos): {err}")
             return None
         tick = str(book.get("tick_size") or market.get("orderPriceMinTickSize") or "0.01")
         tick_f = float(tick)
@@ -747,7 +759,15 @@ def follow(ex: Executor, path: str, overrides: dict, from_start: bool = False) -
 # ═══════════════════════════════════════════════════════════
 #  CLI
 # ═══════════════════════════════════════════════════════════
+class _HideFakNoMatch(logging.Filter):
+    """La librería imprime un error por cada FAK sin contraparte; para nosotros
+    es un reintento normal (el ejecutor ya avisa SIN_LLENAR al final)."""
+    def filter(self, record):
+        return "no orders found to match" not in record.getMessage()
+
+
 def setup_logging(base_dir: str) -> None:
+    logging.getLogger("py_clob_client_v2.http_helpers.helpers").addFilter(_HideFakNoMatch())
     fmt = logging.Formatter("%(asctime)s %(message)s", "%H:%M:%S")
     log.setLevel(logging.INFO)
     log.handlers.clear()

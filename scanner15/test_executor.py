@@ -438,3 +438,27 @@ def test_interrupted_purchase_is_flagged_on_restart(tmp_path):
     [o] = ex2.state["orders"]
     assert o["estado"] == "INTERRUMPIDA" and o["resultado"] == "—"
     assert ex2.handle_signals([sig(clk, price=0.53)]) == []   # el mercado sigue usado
+
+
+def test_gamma_hiccup_is_retried(tmp_path):
+    """Un 'Connection reset' suelto ya no hace perder la señal (pasó a las 19:05)."""
+    ex, clk, g, c = make(tmp_path)
+    orig, calls = g.market, []
+
+    def flaky(slug):
+        calls.append(slug)
+        if len(calls) == 1:
+            raise ConnectionResetError(54, "Connection reset by peer")
+        return orig(slug)
+    g.market = flaky
+    [rec] = ex.handle_signals([sig(clk)])
+    assert rec["estado"] == "LLENADA" and len(calls) == 2
+
+
+def test_fak_no_match_log_is_hidden():
+    import logging
+    rec = logging.LogRecord("x", logging.ERROR, "", 0,
+                            "[py_clob_client_v2] request error status=400 body=no orders found to match with FAK order", None, None)
+    assert E._HideFakNoMatch().filter(rec) is False
+    rec2 = logging.LogRecord("x", logging.ERROR, "", 0, "[py_clob_client_v2] request error status=401", None, None)
+    assert E._HideFakNoMatch().filter(rec2) is True
