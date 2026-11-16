@@ -34,19 +34,48 @@ def _stats(trades: list[dict], v: int) -> str:
             f"{w}/{len(done)} aciertos ({w / len(done):.0%} vs {exp:.0%} esperado), P&L {pnl:+.2f} USD")
 
 
+def _row(label: str, g: list[dict]) -> str:
+    done = [x for x in g if x.get("result")]
+    w = sum(x["result"] == "W" for x in done)
+    pct = f"{w / len(done):4.0%}" if done else "   —"
+    pnl = sum(x["pnl"] for x in done)
+    return f"{label:<12}{len(g):>8}{len(done):>9}{w:>8}{len(done) - w:>9}   {pct}  {pnl:>+9.2f}"
+
+
+HEAD = f"{'':<12}{'señales':>8}{'cerradas':>9}{'ganadas':>8}{'perdidas':>9}  aciertos   P&L USD"
+
+
+def breakdown(trades: list[dict], v: int) -> list[str]:
+    """Por día (últimos 7) y por precio pagado. Es el papel: cuenta TODAS las señales,
+    sin límite diario (el límite solo lo aplica el ejecutor)."""
+    t = [x for x in trades if x.get("v", 1) == v]
+    if not t:
+        return []
+    out = ["", f"— modelo v{v} por día (papel, sin límite de pérdida) —", HEAD]
+    days = sorted({x.get("time", "")[:10] for x in t})[-7:]
+    for d in days:
+        out.append(_row(d, [x for x in t if x.get("time", "").startswith(d)]))
+    out += ["", f"— modelo v{v} por precio pagado —", HEAD]
+    for lo, hi in ((0.30, 0.40), (0.40, 0.45), (0.45, 0.50), (0.50, 0.55), (0.55, 0.60), (0.60, 0.71)):
+        out.append(_row(f"{lo*100:.0f}–{hi*100:.0f}¢", [x for x in t if lo <= x.get("ask", 0) < hi]))
+    return out
+
+
 def summary() -> str:
     lines = ["SCANNER 15m — estado", ""]
     try:
         with open(os.path.join(DATA, "papel.json")) as f:
             trades = json.load(f)
         lines += [_stats(trades, 2), _stats(trades, 1)]
+        lines += breakdown(trades, 2)
     except (OSError, ValueError):
         lines.append("papel.json todavía no existe")
     log = os.path.join(DATA, "executor.log")
     if os.path.exists(log):
         with open(log, errors="replace") as f:
             tail = deque(f, maxlen=25)
-        lines += ["", "— últimas líneas del ejecutor —", *[x.rstrip() for x in tail]]
+        lines += ["", "— últimas líneas del ejecutor (simula dinero real: SÍ aplica el límite de $5) —",
+                  *[x.rstrip() for x in tail]]
     sizes = [f"{n}: {os.path.getsize(os.path.join(DATA, n)) // 1024} KB"
              for n in FILES if os.path.exists(os.path.join(DATA, n))]
     lines += ["", "— archivos (/f/<nombre>?t=...) —", *sizes]

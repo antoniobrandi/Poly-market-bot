@@ -165,7 +165,8 @@ def test_webstatus_requires_token_and_only_serves_listed_files(tmp_path, monkeyp
     import webstatus as W
     W = importlib.reload(W)
     (tmp_path / "papel.json").write_text(json.dumps(
-        [{"v": 2, "fair": 0.55, "result": "W", "pnl": 0.9}, {"fair": 0.6, "result": "L", "pnl": -1}]))
+        [{"v": 2, "fair": 0.55, "ask": 0.52, "time": "2026-11-16 10:00:00", "result": "W", "pnl": 0.9},
+         {"fair": 0.6, "ask": 0.5, "result": "L", "pnl": -1}]))
     (tmp_path / ".env").write_text("POLYMARKET_PRIVATE_KEY=nunca")
     srv = W.ThreadingHTTPServer(("127.0.0.1", 0), W.Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -181,6 +182,7 @@ def test_webstatus_requires_token_and_only_serves_listed_files(tmp_path, monkeyp
     assert get("/")[0] == 403 and get("/?t=mal")[0] == 403
     code, body = get("/?t=secreto")
     assert code == 200 and "modelo v2: 1 cerradas" in body and "modelo v1: 1 cerradas" in body
+    assert "por día" in body and "por precio pagado" in body
     assert get("/f/papel.json?t=secreto")[0] == 200
     assert get("/f/.env?t=secreto")[0] == 404
     assert get("/f/../.env?t=secreto")[0] == 404
