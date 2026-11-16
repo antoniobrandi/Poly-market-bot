@@ -24,12 +24,20 @@ CLOB_HOST = "https://clob.polymarket.com"
 BOT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+_KEYS = ("POLYMARKET_PRIVATE_KEY", "POLYMARKET_PROXY_ADDRESS", "PROXY_ADDRESS",
+         "POLYMARKET_API_KEY", "POLYMARKET_API_SECRET", "POLYMARKET_API_PASSPHRASE")
+
+
 def load_bot_env(bot_dir: Optional[str] = None) -> dict:
-    """Lee el .env del bot como dict (no lo copia ni lo exporta)."""
+    """Lee el .env del bot como dict (no lo copia ni lo exporta). Sin .env (servidor),
+    toma esas mismas variables del entorno, p. ej. las variables secretas de Railway."""
     path = os.path.join(bot_dir or BOT_DIR, ".env")
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"No existe {path}")
-    return {k: (v or "") for k, v in dotenv_values(path).items()}
+    if os.path.exists(path):
+        return {k: (v or "") for k, v in dotenv_values(path).items()}
+    env = {k: os.environ[k] for k in _KEYS if os.environ.get(k)}
+    if not env:
+        raise FileNotFoundError(f"No existe {path} ni variables POLYMARKET_* en el entorno")
+    return env
 
 
 def make_public_client():

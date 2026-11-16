@@ -57,6 +57,8 @@ TAKER_FEE_RATE   = 0.07   # comisión estimada = acciones × rate × p × (1−p
 WINDOW_S         = 900
 
 HERE    = os.path.dirname(os.path.abspath(__file__))
+# Donde viven estado, registros y STOP. En el servidor: el disco persistente (/data).
+DATA_DIR = os.getenv("SCANNER_DATA_DIR", HERE)
 BOT_DIR = os.path.expanduser(os.getenv("POLY_BOT_DIR", "~/Desktop/Poly-market-bot"))
 GAMMA   = "https://gamma-api.polymarket.com"
 
@@ -244,7 +246,7 @@ CSV_COLS = [
 
 
 class Executor:
-    def __init__(self, live: bool = False, clob=None, gamma=None, base_dir: str = HERE,
+    def __init__(self, live: bool = False, clob=None, gamma=None, base_dir: str = DATA_DIR,
                  now: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep,
                  fill_timeout: float = FILL_TIMEOUT_S, poll_s: float = 1.0):
         self.live = bool(live)
@@ -802,7 +804,7 @@ def main(argv=None) -> int:
     p.add_argument("--status", action="store_true", help="resumen y salir")
     a = p.parse_args(argv)
 
-    setup_logging(HERE)
+    setup_logging(DATA_DIR)
     force_ipv4()
 
     if a.check:
