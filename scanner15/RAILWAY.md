@@ -15,8 +15,8 @@ Corre en un servicio **aparte** del bot de deportes, en el mismo repo:
 2. En el servicio nuevo → **Settings**:
    - **Source → Branch**: `claude/vibrant-hopper-9ipyjk` (o `main` cuando se
      haga merge del PR).
-   - **Config-as-code → Railway config file**: `scanner15/railway.json`.
-     Así usa `scanner15/Dockerfile` y no el del bot de deportes.
+   - **Source → Root Directory**: `scanner15`. Así usa `scanner15/railway.json`
+     y `scanner15/Dockerfile`, no los del bot de deportes en la raíz.
    - **Deploy → Region**: una de **Europa** (p. ej. EU West / Amsterdam).
      **Obligatorio**: Binance bloquea servidores de EE. UU.
    - **Networking → Generate Domain**: para la página de estado.

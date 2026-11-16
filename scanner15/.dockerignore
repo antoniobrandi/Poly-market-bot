@@ -1,0 +1,12 @@
+__pycache__
+*.pyc
+.venv
+.env
+*.log
+senales.csv
+papel.json
+mercado.csv
+resultados.csv
+ordenes*.csv
+executor_state*.json
+STOP
